@@ -1,0 +1,49 @@
+﻿# 构建产物
+build/
+out/
+bin/
+lib/
+obj/
+x64/
+Debug/
+Release/
+
+# Visual Studio
+.vs/
+*.user
+*.suo
+*.sdf
+*.VC.db
+*.VC.opendb
+*.vcxproj.filters
+ipch/
+
+# 编译中间文件
+*.obj
+*.o
+*.pch
+*.pdb
+*.ilk
+*.exp
+*.iobj
+*.ipdb
+*.tlog
+*.log
+*.lastbuildstate
+*.recipe
+
+# 测试产物
+testResult.txt
+Testing/
+
+# 编辑器
+.vscode/
+.idea/
+*.swp
+.DS_Store
+Thumbs.db
+
+# 注意：thirdparty/ 是 git submodule，必须提交 .gitmodules
+
+# 交叉编译输出
+build-*/

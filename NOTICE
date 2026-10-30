@@ -1,0 +1,78 @@
+# NOTICE — 第三方声明
+
+本项目参考了若干开源项目的设计与接口约定。此处如实声明来源与范围。
+
+---
+
+## 1. JRTPLIB（rtplib）
+
+| 项 | 内容 |
+|---|---|
+| 项目地址 | https://codeberg.org/j0r1/JRTPLIB |
+| 版权人 | Copyright (c) 1999-2017 Jori Liesenborgs |
+| 联系方式 | jori.liesenborgs@gmail.com |
+| 许可证 | MIT License |
+
+### 使用方式
+
+**参考其协议实现思路，代码为独立实现，未复制源文件。**
+
+具体参考的部分：
+
+| 主题 | 参考的内容 |
+|---|---|
+| RTP 固定头 / 扩展头 / CSRC / padding 的字段布局 | RFC 3550 定义的位布局，以及 rtplib 对边界情况的处理方式 |
+| RTCP 复合包的组装与拆分 | RFC 3550 §6.1 的复合规则 |
+| RTCP 发送间隔调度 | RFC 3550 §6.2 / §6.3.1 的带宽分配与随机抖动 |
+| 源跟踪（序列号回绕、丢包率、抖动） | RFC 3550 §6.4 / A.8 的算法 |
+| SSRC 冲突检测与处理 | RFC 3550 §8.2 的判定条件与 BYE + 换号流程 |
+
+上表列的都是 **RFC 明文规定的行为**——rtplib 是一份成熟的实现参考，
+我们的代码按其行为重新编写，并通过相同的测试场景验证。
+
+为稳妥起见（MIT 许可证要求保留版权与许可声明），仍在此完整标注其版权信息。
+
+### 明确未使用的部分
+
+| rtplib 组件 | 本项目替代方案 |
+|---|---|
+| `RTPTransmitter` / `RTPUDPv4Transmitter`（传输层） | netmech 的 `UdpEndpoint` |
+| `RTPPollThread`（每会话一条轮询线程） | netmech 的 io 线程池（固定条数，事件驱动） |
+| `RTPSession::Poll()`（拉模式） | 推模式：`RtpHandler::on_packet` 回调 |
+| `RTPMemoryManager`（自定义内存管理） | 标准库 + 零分配解析 |
+| `RTPRandom*`（随机数） | `std::chrono` + 地址混合 |
+| `RTPTime`（时间工具） | `std::chrono` |
+| `RTPIPv4Address` / `RTPIPv6Address` | netmech 的 `Address` |
+| `AddDestination`（单会话多目标） | 未实现，记入下版本 |
+| SRTP 加解密 | 未实现 |
+
+### 为什么不用它的传输层
+
+见 [`docs/design/overview-design.md`](docs/design/overview-design.md) §1.5。
+一句话：200 路时"每会话一条线程 + 10 ms 轮询 + 65 处锁"的开销无法接受。
+
+---
+
+## 2. Asio
+
+| 项 | 内容 |
+|---|---|
+| 项目地址 | https://github.com/chriskohlhoff/asio |
+| 版权人 | Copyright (c) 2003-2024 Christopher M. Kohlhoff |
+| 许可证 | Boost Software License 1.0 |
+
+Asio 通过 `thirdparty/netmech` 间接引用（netmech 内置了独立版 Asio，无需安装 Boost）。
+许可证全文见 `thirdparty/netmech/thirdparty/asio/LICENSE_1_0.txt`。
+
+---
+
+## 3. NetMechanism（netmech）
+
+| 项 | 内容 |
+|---|---|
+| 项目地址 | 同级目录 `../netmech`（git submodule） |
+| 许可证 | MIT |
+| 关系 | rtpmech 依赖 netmech 提供 UDP 传输、io 线程模型与端点级定时器 |
+
+rtpmech 的线程模型、端口绑定策略、发送语义（"受理 / 未受理"）都继承自 netmech，
+两边的契约是一致的。
