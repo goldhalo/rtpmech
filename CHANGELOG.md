@@ -53,6 +53,14 @@
 - MTU 保护：超过 `max_packet_size`（默认 1400）直接返回 `invalid`，不发出，不做 IP 分片。
 - 零分配解析：`RtpPacket` 是只读视图，回调里直接读，不拷贝。
 
+**载荷分片（新增）**
+
+- `Packetizer` 抽象接口：把一帧切成若干个 RTP payload，不侵入 `RtpSession`。
+- `H264Packetizer`（RFC 6184）：单 NAL 包 + FU-A 分片，参数集带内发送可关。
+- `H265Packetizer`（RFC 7798）：单 NAL 包 + FU 分片，VPS/SPS/PPS 可关。
+  **与 H264 不共用代码**——NAL 头 1→2 字节、分片头 2→3 字节、参数集 2→3 个。
+- PS/TS 不在本库职责内（容器封装，与 RTP 正交），应用自己实现 `Packetizer`。
+
 ### 已知限制
 
 - 单会话只支持**一个**接收目标（`remote` + `send_to`）。多目标群发留到下版本。

@@ -7,13 +7,16 @@
 //  依赖    : netmech（Address / Buf / ConstBuf / UdpEndpoint）
 //  编码    : UTF-8
 //
-//  ★ 公共头只有 6 个
+//  ★ 公共头 8 个
 //  ---------------------------------------------------------------------------
 //    span.hpp          轻量 span（C++17 没有 std::span）
 //    error.hpp         RtpErrc 错误码
 //    rtp_packet.hpp    RtpPacket（只读视图）+ RtpPacketInfo + 构造
 //    rtcp_packet.hpp   RtcpCompoundPacket + 各子包（SR/RR/SDES/BYE/APP）
 //    session.hpp       RtpSession / RtpHandler / Config / SendResult / Stats
+//    packetizer.hpp    Packetizer（载荷分片接口）
+//    h264.hpp          H264Packetizer（RFC 6184）
+//    h265.hpp          H265Packetizer（RFC 7798）
 //    rtpmech.hpp       本文件（汇总）
 //
 //    source_tracker / rtcp_scheduler 是**实现细节**，不对外：
@@ -38,3 +41,8 @@
 
 // 会话
 #include <rtpmech/session.hpp>
+
+// 载荷分片
+#include <rtpmech/packetizer.hpp>
+#include <rtpmech/h264.hpp>
+#include <rtpmech/h265.hpp>

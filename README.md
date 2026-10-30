@@ -133,6 +133,49 @@ void on_packet(RtpSession&, const RtpPacket& pkt, const Address& from) override
 
 ---
 
+## 载荷分片（H.264 / H.265）
+
+`RtpSession::send()` 的契约始终是**一个 send = 一个 RTP 包**。要按标准把一帧切成
+多个包，用 `Packetizer`：
+
+```cpp
+#include <rtpmech/rtpmech.hpp>
+
+H264Packetizer pkt;      // 或 H265Packetizer（RFC 7798，格式不同）
+
+pkt.on_frame(frame, [&](span<const std::uint8_t> payload, bool marker) {
+    sess.send({nullptr, payload.data(), payload.size()}, marker);
+});
+```
+
+| 分片器 | 标准 | 支持 |
+|---|---|---|
+| `H264Packetizer` | RFC 6184 | 单 NAL 包、FU-A 分片；参数集带内可关 |
+| `H265Packetizer` | RFC 7798 | 单 NAL 包、FU 分片；VPS/SPS/PPS 可关 |
+
+**H.264 和 H.265 的 RTP 格式不一样**，不能共用：
+
+| 项 | H.264 | H.265 |
+|---|---|---|
+| NAL 头 | 1 字节 | **2 字节** |
+| 分片类型 | FU-A（28） | FU（49） |
+| 分片头 | 1 + 1 字节 | **2 + 1 字节** |
+| 聚合 | STAP-A（24） | AP（48） |
+| 参数集 | SPS/PPS | **VPS/SPS/PPS** |
+
+**PS / TS 不归 rtpmech 管**。它们是容器封装（GB/T 28181、RFC 2250），跟 RTP
+是正交的两层。需要的话自己实现 `rtpmech::Packetizer` 接口：
+
+```cpp
+class PsPacketizer : public rtpmech::Packetizer {
+    void on_frame(span<const std::uint8_t> frame, const Sink& sink) override {
+        // 封 PS → 按 1400 切块 → sink(chunk, is_last)
+    }
+};
+```
+
+---
+
 ## 构建
 
 ### 依赖
