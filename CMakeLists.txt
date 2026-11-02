@@ -48,6 +48,15 @@ option(RTPMECH_BUILD_EXAMPLES "构建 rtpmech 示例" ON)
 option(RTPMECH_WARNINGS_AS_ERRORS "把编译告警当错误（CI 用）" OFF)
 option(RTPMECH_BUILD_BENCH    "构建压测工具" OFF)
 
+# 位置无关代码。
+#
+# 本库只出静态库，但静态库常常被链进 .so。缺 -fPIC 时编静态库、跑单测都
+# 正常，**只在最终链 .so 那一步**报：
+#     relocation R_X86_64_PC32 against symbol `...' can not be used when
+#     making a shared object; recompile with -fPIC
+# 纯静态场景可 -DRTPMECH_PIC=OFF。
+option(RTPMECH_PIC "编译为位置无关代码（静态库要链进 .so 时必须开）" ON)
+
 # ---------------------------------------------------------------------------
 # 2. 定位 netmech
 # ---------------------------------------------------------------------------
@@ -108,6 +117,8 @@ file(GLOB_RECURSE RTPMECH_SOURCES CONFIGURE_DEPENDS
 
 add_library(rtpmech STATIC ${RTPMECH_SOURCES})
 add_library(rtpmech::rtpmech ALIAS rtpmech)
+set_target_properties(rtpmech PROPERTIES
+    POSITION_INDEPENDENT_CODE ${RTPMECH_PIC})
 
 target_include_directories(rtpmech
     PUBLIC  "${CMAKE_CURRENT_SOURCE_DIR}/include"
@@ -115,7 +126,7 @@ target_include_directories(rtpmech
 
 # 显式补上 netmech 与 Asio 的 include 目录。
 #
-# 为什么不能只靠 target_link_libraries(rtpmech PUBLIC NetMechanism)：
+# 为什么不能只靠 target_link_libraries(rtpmech PUBLIC netmech)：
 #   netmech 的 include 目录用 $<BUILD_INTERFACE:...> 声明，当它作为
 #   add_subdirectory 引入时，部分 CMake 版本（实测 4.4）不会把该 genex
 #   求值结果传递到父工程的 public 接口 —— 表现为
@@ -126,7 +137,7 @@ target_include_directories(rtpmech PUBLIC
     "${RTPMECH_NETMECH_DIR}/thirdparty/asio/include")
 
 target_link_libraries(rtpmech
-    PUBLIC  NetMechanism
+    PUBLIC  netmech
     PRIVATE rtpmech_compile_options)
 
 target_compile_features(rtpmech PUBLIC cxx_std_17)
