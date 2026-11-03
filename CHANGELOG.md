@@ -5,6 +5,27 @@
 
 ---
 
+## [未发布]
+
+### 新增
+
+**CMake 安装与导出（find_package）**
+
+- `cmake --install` 现在装出完整的一套：头文件、静态库、`lib/cmake/rtpmech/` 下的
+  `rtpmechConfig.cmake` / `rtpmechConfigVersion.cmake` / `rtpmechTargets.cmake`，
+  以及 `share/doc/rtpmech` 下的 LICENSE / NOTICE
+- 使用者只需要两行：
+  ```cmake
+  find_package(rtpmech REQUIRED)
+  target_link_libraries(app PRIVATE rtpmech::rtpmech)
+  ```
+- Config 里 `find_dependency(netmech)`：`librtpmech.a + libnetmech.a + pthread`
+  这一串不用再手写
+
+- 默认安装前缀：Linux `/usr/local`，Windows `C:/Program Files/rtpmech`
+
+---
+
 ## [0.9.0] — 首个版本
 
 功能完整，Windows / Linux x86_64 / Linux aarch64 三平台验证过。

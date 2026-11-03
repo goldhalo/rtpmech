@@ -1,0 +1,20 @@
+@PACKAGE_INIT@
+
+# -----------------------------------------------------------------------------
+#  rtpmechConfig.cmake —— find_package(rtpmech) 的入口
+# -----------------------------------------------------------------------------
+#  用法：
+#      find_package(rtpmech REQUIRED)
+#      target_link_libraries(app PRIVATE rtpmech::rtpmech)
+#
+#  rtpmech 的公共头暴露了 netmech::Address / netmech::UdpEndpoint，
+#  导出的 target 也带着 netmech::netmech —— 先把它找出来。
+# -----------------------------------------------------------------------------
+
+include(CMakeFindDependencyMacro)
+
+find_dependency(netmech)
+
+include("${CMAKE_CURRENT_LIST_DIR}/rtpmechTargets.cmake")
+
+check_required_components(rtpmech)

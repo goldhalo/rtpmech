@@ -27,6 +27,11 @@ if(NOT CMAKE_CONFIGURATION_TYPES AND NOT CMAKE_BUILD_TYPE)
     set(CMAKE_BUILD_TYPE Release CACHE STRING "Build type" FORCE)
 endif()
 
+# 安装目录规范。必须早于 target 定义：$<INSTALL_INTERFACE:${CMAKE_INSTALL_INCLUDEDIR}>
+# 里的变量是立即展开的，晚定义会展开成空串。
+include(GNUInstallDirs)
+include(CMakePackageConfigHelpers)
+
 set(RTPMECH_OUTPUT_DIR "${CMAKE_BINARY_DIR}/bin")
 set(CMAKE_RUNTIME_OUTPUT_DIRECTORY         "${RTPMECH_OUTPUT_DIR}")
 set(CMAKE_RUNTIME_OUTPUT_DIRECTORY_DEBUG   "${RTPMECH_OUTPUT_DIR}")
@@ -121,7 +126,8 @@ set_target_properties(rtpmech PROPERTIES
     POSITION_INDEPENDENT_CODE ${RTPMECH_PIC})
 
 target_include_directories(rtpmech
-    PUBLIC  "${CMAKE_CURRENT_SOURCE_DIR}/include"
+    PUBLIC  $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
+            $<INSTALL_INTERFACE:${CMAKE_INSTALL_INCLUDEDIR}>
     PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/src")
 
 # 显式补上 netmech 与 Asio 的 include 目录。
@@ -132,9 +138,13 @@ target_include_directories(rtpmech
 #   求值结果传递到父工程的 public 接口 —— 表现为
 #       fatal error C1083: 无法打开包括文件 "netmech/net.hpp"
 #   因此这里显式追加路径，保证构建稳定。
+#
+#   只对构建树生效（BUILD_INTERFACE）：装出去之后这两个目录由
+#   find_package(netmech) 给的 netmech::netmech 自带，不用再写死绝对路径
+#   —— 否则导出的 Config 里会留下别人机器上不存在的路径。
 target_include_directories(rtpmech PUBLIC
-    "${RTPMECH_NETMECH_DIR}/include"
-    "${RTPMECH_NETMECH_DIR}/thirdparty/asio/include")
+    $<BUILD_INTERFACE:${RTPMECH_NETMECH_DIR}/include>
+    $<BUILD_INTERFACE:${RTPMECH_NETMECH_DIR}/thirdparty/asio/include>)
 
 target_link_libraries(rtpmech
     PUBLIC  netmech
@@ -195,7 +205,52 @@ if(RTPMECH_BUILD_BENCH)
 endif()
 
 # ---------------------------------------------------------------------------
-# 7. 摘要
+# 7. 安装与导出
+# ---------------------------------------------------------------------------
+#  装完之后使用者只需要：
+#      find_package(rtpmech REQUIRED)
+#      target_link_libraries(app PRIVATE rtpmech::rtpmech)
+#  netmech、Threads 由导出的 target 带着走，不用手写 librtpmech.a + libnetmech.a。
+#
+#  默认前缀：Linux -> /usr/local，Windows -> C:/Program Files/rtpmech
+# ---------------------------------------------------------------------------
+install(TARGETS rtpmech
+        EXPORT rtpmechTargets
+        ARCHIVE DESTINATION ${CMAKE_INSTALL_LIBDIR}
+        LIBRARY DESTINATION ${CMAKE_INSTALL_LIBDIR}
+        RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR})
+
+# 编译选项载体（PRIVATE 依赖在静态库场景下仍会进 interface，必须一起导出）
+install(TARGETS rtpmech_compile_options EXPORT rtpmechTargets)
+
+install(DIRECTORY include/rtpmech
+        DESTINATION ${CMAKE_INSTALL_INCLUDEDIR}
+        FILES_MATCHING PATTERN "*.hpp")
+
+install(EXPORT rtpmechTargets
+        FILE rtpmechTargets.cmake
+        NAMESPACE rtpmech::
+        DESTINATION ${CMAKE_INSTALL_LIBDIR}/cmake/rtpmech)
+
+configure_package_config_file(cmake/rtpmechConfig.cmake.in
+        "${CMAKE_CURRENT_BINARY_DIR}/rtpmechConfig.cmake"
+        INSTALL_DESTINATION ${CMAKE_INSTALL_LIBDIR}/cmake/rtpmech)
+
+write_basic_package_version_file(
+        "${CMAKE_CURRENT_BINARY_DIR}/rtpmechConfigVersion.cmake"
+        VERSION ${PROJECT_VERSION}
+        COMPATIBILITY SameMinorVersion)
+
+install(FILES
+        "${CMAKE_CURRENT_BINARY_DIR}/rtpmechConfig.cmake"
+        "${CMAKE_CURRENT_BINARY_DIR}/rtpmechConfigVersion.cmake"
+        DESTINATION ${CMAKE_INSTALL_LIBDIR}/cmake/rtpmech)
+
+install(FILES LICENSE NOTICE
+        DESTINATION ${CMAKE_INSTALL_DATADIR}/doc/rtpmech)
+
+# ---------------------------------------------------------------------------
+# 8. 摘要
 # ---------------------------------------------------------------------------
 message(STATUS "----------------------------------------------------------")
 message(STATUS " rtpmech ${PROJECT_VERSION}")

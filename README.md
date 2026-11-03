@@ -291,6 +291,32 @@ jrtplib 是主要参考对象，但**只借鉴协议层，底层通信自己实�
 
 ---
 
+## 在其他项目里使用（find_package）
+
+先装 netmech，再装 rtpmech：
+
+```bash
+cmake -S ../netmech -B ../netmech/build && cmake --build ../netmech/build -j
+cmake --install ../netmech/build
+
+cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
+cmake --build build -j
+cmake --install build                  # 默认前缀：Linux /usr/local
+```
+
+然后：
+
+```cmake
+find_package(rtpmech REQUIRED)
+target_link_libraries(app PRIVATE rtpmech::rtpmech)
+```
+
+`librtpmech.a + libnetmech.a + pthread` 不用手写，导入的 target 全带着。
+注意 `rtpmech/session.hpp` 暴露了 `netmech::Address` / `netmech::UdpEndpoint`，
+所以 netmech 包是必需的。
+
+---
+
 ## 致谢
 
 本项目的实现与文档在 **DeepSeek-V4.1** 的协助下完成 —— 架构决策与验收由作者负责，
