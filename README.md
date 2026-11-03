@@ -315,6 +315,11 @@ target_link_libraries(app PRIVATE rtpmech::rtpmech)
 注意 `rtpmech/session.hpp` 暴露了 `netmech::Address` / `netmech::UdpEndpoint`，
 所以 netmech 包是必需的。
 
+> **安装约定（五个 mech 库统一）**：一个包只装自己，依赖由
+> `Config.cmake` 里的 `find_dependency` 声明、由使用者自己装。
+> 所以 `cmake --install` 本仓**不会**把 netmech 一起装上，
+> 顺序必须是"先 netmech，后 rtpmech"。
+
 ---
 
 ## 致谢

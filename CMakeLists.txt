@@ -80,9 +80,21 @@ endif()
 # 作为子工程引入 netmech（不构建它的测试/示例）
 set(NETMECH_BUILD_TESTS    OFF CACHE BOOL "" FORCE)
 set(NETMECH_BUILD_EXAMPLES OFF CACHE BOOL "" FORCE)
-# 注意：不使用 EXCLUDE_FROM_ALL —— 否则 netmech 的 include 目录不会
-# 传递到 rtpmech，导致 fatal error C1083: netmech/net.hpp not found。
-add_subdirectory("${RTPMECH_NETMECH_DIR}" "${CMAKE_BINARY_DIR}/netmech")
+
+# EXCLUDE_FROM_ALL：netmech 只参与编译，**不参与本仓的安装**。
+#
+# 约定（五个 mech 库统一）：**一个包只装自己，依赖由 Config 里的
+# find_dependency 声明、由使用者自己装**。所以用完这个包的人要先
+#   cmake --install ../netmech/build
+# 再
+#   cmake --install build
+# 这样版本归属清楚：前缀里躺的是谁装的 netmech，一目了然。
+#
+# 历史备注：这里原先**没有** EXCLUDE_FROM_ALL，注释给的理由是"加了会丢
+# include 传递，报 C1083"。实测（CMake 4.2.3 / gcc）不成立 —— 下文第 4 节
+# 已经把 netmech 与 Asio 的 include 目录显式补上了，不依赖 genex 传递。
+add_subdirectory("${RTPMECH_NETMECH_DIR}" "${CMAKE_BINARY_DIR}/netmech"
+                 EXCLUDE_FROM_ALL)
 
 message(STATUS "rtpmech: netmech @ ${RTPMECH_NETMECH_DIR}")
 
