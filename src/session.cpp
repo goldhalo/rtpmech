@@ -17,6 +17,7 @@
 // =============================================================================
 #include "rtpmech/session.hpp"
 
+#include <atomic>
 #include <rtpmech/rtcp_packet.hpp>
 #include <rtpmech/rtp_packet.hpp>
 
