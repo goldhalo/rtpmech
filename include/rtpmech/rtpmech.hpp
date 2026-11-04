@@ -34,6 +34,8 @@
 // 基础类型与错误码
 #include <rtpmech/span.hpp>
 #include <rtpmech/error.hpp>
+#include <rtpmech/endpoint.hpp>
+#include <rtpmech/buffer.hpp>
 
 // 报文
 #include <rtpmech/rtp_packet.hpp>

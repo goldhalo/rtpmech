@@ -5,7 +5,7 @@
 //
 //  相对现有实现的改动（已确认）：
 //    1. 回调用虚函数 `RtpHandler`，与 netmech 的 `ConnHandler` 同构
-//    2. 地址类型用 `netmech::Address`，公共头不暴露 asio
+//    2. 地址类型用本库自己的 `rtpmech::Endpoint`（公共头不引 netmech、不暴露 asio）
 //    3. 双端口：RTP 与 RTCP 各占一个，**RTCP 恒为 RTP + 1**（RFC 3550）
 //    4. `RtpSession` 内部持有两个 `netmech::UdpEndpoint`（组合，不继承）
 //    5. 发送用 `SendResult` 枚举
@@ -18,11 +18,12 @@
 
 #include <cstdint>
 #include <memory>
+#include <system_error>
 #include <optional>
 #include <string>
 
-#include <netmech/common.hpp>
-#include <netmech/udp.hpp>
+#include <rtpmech/buffer.hpp>
+#include <rtpmech/endpoint.hpp>
 
 namespace rtpmech {
 
@@ -62,7 +63,7 @@ struct RtpSessionConfig {
     ///
     /// - `port == 0`：由系统分配，并保证落在偶数端口（RFC 3550 §11）；
     /// - `port != 0`：从该端口起尝试绑定 `(p, p+1)`，**两个都成功才算成功**。
-    netmech::Address local{"0.0.0.0", 0};
+    Endpoint local{"0.0.0.0", 0};
 
     /// 端口搜索上界（含）。仅在 `local.port() != 0` 时有意义。
     ///
@@ -78,12 +79,12 @@ struct RtpSessionConfig {
     /// 必须用 `send_to()` 显式指定。
     ///
     /// @note RTCP 的目标自动推导为 `remote.port() + 1`。
-    std::optional<netmech::Address> remote;
+    std::optional<Endpoint> remote;
 
     // ---- 组播（只作用于 RTP 端点） ----
 
-    std::optional<netmech::Address> multicast_group;
-    std::optional<netmech::Address> multicast_interface;
+    std::optional<Endpoint> multicast_group;
+    std::optional<Endpoint> multicast_interface;
     std::uint8_t multicast_hops     = 1;
     bool         multicast_loopback = true;
 
@@ -173,14 +174,14 @@ public:
     ///
     /// @note 与 netmech 的 `borrow` 交付一致：不做拷贝、零分配。
     virtual void on_packet(RtpSession& sess, const RtpPacket& pkt,
-                           const netmech::Address& from) = 0;
+                           const Endpoint& from) = 0;
 
     /// 收到一个 RTCP 复合包（SR / RR / SDES / BYE 等）。
     ///
     /// **一般不需要实现**——SR/RR 的生成与解析、RTT 计算、成员管理都由库内部完成，
     /// 这里只是把收到的报文透出来供观测（打日志、做监控）。
     virtual void on_rtcp(RtpSession& sess, const RtcpCompoundPacket& compound,
-                         const netmech::Address& from)
+                         const Endpoint& from)
     {
         (void)sess;
         (void)compound;
@@ -292,16 +293,16 @@ public:
     ///
     /// @par 缓冲区
     ///  返回 `accepted` 后 `payload` 指向的内存必须保持有效直到发送完成；
-    ///  异步场景请用 `netmech::ConstBuf` 的 owner 形式让库代持。
-    SendResult send(netmech::ConstBuf payload, bool marker);
+    ///  异步场景请用 `ConstBuf` 的 owner 形式让库代持。
+    SendResult send(ConstBuf payload, bool marker);
 
     /// 指定时间戳发送（关键帧对齐等场景需要自己控制）。
-    SendResult send_with_timestamp(netmech::ConstBuf payload, bool marker,
+    SendResult send_with_timestamp(ConstBuf payload, bool marker,
                                    std::uint32_t timestamp);
 
     /// 发到显式目标（覆盖配置里的 remote）。
-    SendResult send_to(const netmech::Address& dst,
-                       netmech::ConstBuf payload, bool marker);
+    SendResult send_to(const Endpoint& dst,
+                       ConstBuf payload, bool marker);
 
     /// 立即发一个 RTCP 复合包（不等定时器）。
     ///

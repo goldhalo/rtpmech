@@ -23,7 +23,6 @@
 #include "test_framework.hpp"
 
 using namespace rtpmech;
-using namespace netmech;
 using namespace netmech_test;
 
 // CHECK_EQ 失败时要打印两侧的值，给 SendResult 补一个输出算子
@@ -60,7 +59,7 @@ bool wait_for(Pred pred, std::chrono::milliseconds timeout = 3000ms)
 /// 收集 RTP 包，记录序列号 / 时间戳 / 载荷长度。
 class Collector : public RtpHandler {
 public:
-    void on_packet(RtpSession&, const RtpPacket& pkt, const Address&) override
+    void on_packet(RtpSession&, const RtpPacket& pkt, const Endpoint&) override
     {
         std::lock_guard<std::mutex> lk(mtx);
         seqs.push_back(pkt.sequence());
@@ -81,13 +80,13 @@ public:
 /// 只发不收的 handler。
 class NullHandler : public RtpHandler {
 public:
-    void on_packet(RtpSession&, const RtpPacket&, const Address&) override {}
+    void on_packet(RtpSession&, const RtpPacket&, const Endpoint&) override {}
 };
 
 RtpSessionConfig base_cfg()
 {
     RtpSessionConfig cfg;
-    cfg.local        = Address("127.0.0.1", 0);
+    cfg.local        = Endpoint("127.0.0.1", 0);
     cfg.payload_type = 96;
     cfg.clock_rate   = 90000;
     return cfg;
@@ -144,7 +143,7 @@ NETMECH_TEST(session_send_receive_roundtrip)
     REQUIRE(!ec);
 
     auto tx_cfg = base_cfg();
-    tx_cfg.remote = Address("127.0.0.1", rx->local_rtp_port());
+    tx_cfg.remote = Endpoint("127.0.0.1", rx->local_rtp_port());
     auto tx = RtpSession::create(tx_cfg, std::make_shared<NullHandler>(), ec);
     REQUIRE(!ec);
 
@@ -177,7 +176,7 @@ NETMECH_TEST(session_sequence_and_timestamp_increment)
     auto rx = RtpSession::create(cfg, collector, ec);
     REQUIRE(!ec);
 
-    cfg.remote = Address("127.0.0.1", rx->local_rtp_port());
+    cfg.remote = Endpoint("127.0.0.1", rx->local_rtp_port());
     auto tx = RtpSession::create(cfg, std::make_shared<NullHandler>(), ec);
     REQUIRE(!ec);
 
@@ -241,7 +240,7 @@ NETMECH_TEST(session_send_after_close_returns_closed)
 
     const std::uint8_t payload[4] = {};
     CHECK_EQ(sess->send({nullptr, payload, sizeof(payload)}, false), SendResult::closed);
-    CHECK_EQ(sess->send_to(Address("127.0.0.1", 9999),
+    CHECK_EQ(sess->send_to(Endpoint("127.0.0.1", 9999),
                            {nullptr, payload, sizeof(payload)}, false),
              SendResult::closed);
     CHECK(!sess->send_rtcp_now());
@@ -277,7 +276,7 @@ NETMECH_TEST(session_rejects_oversized_payload)
     auto rx = RtpSession::create(cfg, collector, ec);
     REQUIRE(!ec);
 
-    cfg.remote = Address("127.0.0.1", rx->local_rtp_port());
+    cfg.remote = Endpoint("127.0.0.1", rx->local_rtp_port());
     auto tx = RtpSession::create(cfg, std::make_shared<NullHandler>(), ec);
     REQUIRE(!ec);
 
@@ -306,7 +305,7 @@ NETMECH_TEST(session_sends_rtcp)
     auto rx = RtpSession::create(cfg, collector, ec);
     REQUIRE(!ec);
 
-    cfg.remote = Address("127.0.0.1", rx->local_rtp_port());
+    cfg.remote = Endpoint("127.0.0.1", rx->local_rtp_port());
     auto tx = RtpSession::create(cfg, std::make_shared<NullHandler>(), ec);
     REQUIRE(!ec);
 
@@ -336,7 +335,7 @@ NETMECH_TEST(session_rtcp_auto_sends_periodically)
     auto rx = RtpSession::create(cfg, collector, ec);
     REQUIRE(!ec);
 
-    cfg.remote = Address("127.0.0.1", rx->local_rtp_port());
+    cfg.remote = Endpoint("127.0.0.1", rx->local_rtp_port());
     auto tx = RtpSession::create(cfg, std::make_shared<NullHandler>(), ec);
     REQUIRE(!ec);
 
@@ -375,7 +374,7 @@ NETMECH_TEST(session_ssrc_collision_changes_ssrc)
 
     // 发送端故意用同一个 SSRC
     auto tx_cfg = cfg;
-    tx_cfg.remote = Address("127.0.0.1", rx->local_rtp_port());
+    tx_cfg.remote = Endpoint("127.0.0.1", rx->local_rtp_port());
     auto tx = RtpSession::create(tx_cfg, std::make_shared<NullHandler>(), ec);
     REQUIRE(!ec);
     REQUIRE(tx->local_ssrc() == 0x11223344u);
@@ -401,16 +400,17 @@ NETMECH_TEST(session_ssrc_collision_changes_ssrc)
 NETMECH_TEST(session_fails_when_rtcp_port_occupied)
 {
     // 探一对可用端口
-    auto base = find_free_port_run(40000, 50000, 2, 2);
+    auto base = netmech::find_free_port_run(40000, 50000, 2, 2);
     REQUIRE(base.has_value());
 
     // 占住 base+1（RTCP 位置）
-    struct Null : UdpHandler {
-        void on_read(UdpEndpoint&, std::error_code, Buf, std::size_t,
-                     const Address&) override {}
+    // 占端口用的是 netmech 的 UDP 端点（测试自己造一个"被占用"的环境）
+    struct Null : netmech::UdpHandler {
+        void on_read(netmech::UdpEndpoint&, std::error_code, netmech::Buf, std::size_t,
+                     const netmech::Address&) override {}
     };
-    UdpConfig blocker_cfg;
-    blocker_cfg.bind = Address("127.0.0.1", static_cast<std::uint16_t>(*base + 1));
+    netmech::UdpConfig blocker_cfg;
+    blocker_cfg.bind = netmech::Address("127.0.0.1", static_cast<std::uint16_t>(*base + 1));
     std::error_code ec;
     auto blocker = create_udp_endpoint(blocker_cfg, std::make_shared<Null>(), nullptr, ec);
     REQUIRE(!ec);
@@ -418,16 +418,16 @@ NETMECH_TEST(session_fails_when_rtcp_port_occupied)
 
     // 用 base 建会话：RTP 能绑，但 RTCP 绑不上 → 整体失败
     auto cfg = base_cfg();
-    cfg.local = Address("127.0.0.1", *base);
+    cfg.local = Endpoint("127.0.0.1", *base);
 
     auto sess = RtpSession::create(cfg, std::make_shared<NullHandler>(), ec);
     CHECK(sess == nullptr);
     CHECK(static_cast<bool>(ec));
 
     // ★ 关键：RTP 端口必须已回滚，否则重试永远绑不上
-    UdpConfig rtp_cfg;
-    rtp_cfg.bind = Address("127.0.0.1", *base);
-    auto after = create_udp_endpoint(rtp_cfg, std::make_shared<Null>(), nullptr, ec);
+    netmech::UdpConfig rtp_cfg;
+    rtp_cfg.bind = netmech::Address("127.0.0.1", *base);
+    auto after = netmech::create_udp_endpoint(rtp_cfg, std::make_shared<Null>(), nullptr, ec);
     CHECK_MSG(!ec, ("RTCP 失败后 RTP 端口没回滚: " + ec.message()).c_str());
     if (after) {
         after->close();
@@ -440,11 +440,11 @@ NETMECH_TEST(session_fails_when_rtcp_port_occupied)
 // ---------------------------------------------------------------------------
 NETMECH_TEST(session_binds_exactly_probed_port)
 {
-    auto base = find_free_port_run(40000, 50000, 2, 2);
+    auto base = netmech::find_free_port_run(40000, 50000, 2, 2);
     REQUIRE(base.has_value());
 
     auto cfg = base_cfg();
-    cfg.local        = Address("127.0.0.1", *base);
+    cfg.local        = Endpoint("127.0.0.1", *base);
     cfg.rtp_port_end = 0;               // 协商已定，不搜别的
 
     std::error_code ec;
@@ -473,7 +473,7 @@ NETMECH_TEST(session_stats_initial_and_grow)
     CHECK_EQ(st0.parse_errors, 0u);
 
     auto tx_cfg = base_cfg();
-    tx_cfg.remote = Address("127.0.0.1", rx->local_rtp_port());
+    tx_cfg.remote = Endpoint("127.0.0.1", rx->local_rtp_port());
     auto tx = RtpSession::create(tx_cfg, std::make_shared<NullHandler>(), ec);
     REQUIRE(!ec);
 

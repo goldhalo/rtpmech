@@ -3,7 +3,7 @@
 // =============================================================================
 //  文件    : rtpmech/rtp_packet.hpp
 //  用途    : RTP (RFC 3550) 固定头 + 扩展头 + CSRC 列表 + 载荷的解析与构造。
-//  依赖    : 标准库 + netmech（仅用于地址类型；本文件本身不涉及网络 IO）
+//  依赖    : 只用标准库（本文件不涉及网络 IO，也不引 netmech）
 //  编码    : UTF-8
 //
 //  ── 部分实现参考自 rtplib ───────────────────────────────────────────────────
@@ -33,8 +33,6 @@
 #include <cstdint>
 #include <optional>
 #include <system_error>
-
-#include <netmech/net.hpp>
 
 #include "rtpmech/error.hpp"
 #include "rtpmech/span.hpp"

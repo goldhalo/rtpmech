@@ -9,7 +9,6 @@
 // =============================================================================
 #include <rtpmech/rtpmech.hpp>
 
-#include <netmech/net.hpp>
 
 #include <atomic>
 #include <chrono>
@@ -21,7 +20,7 @@
 #include <vector>
 
 using namespace rtpmech;
-using netmech::Address;
+using rtpmech::Endpoint;
 
 namespace {
 
@@ -29,7 +28,7 @@ using namespace std::chrono_literals;
 
 class Collector : public RtpHandler {
 public:
-    void on_packet(RtpSession&, const RtpPacket& pkt, const Address&) override
+    void on_packet(RtpSession&, const RtpPacket& pkt, const Endpoint&) override
     {
         std::lock_guard<std::mutex> lk(mtx);
         seqs.push_back(pkt.sequence());
@@ -45,7 +44,7 @@ public:
 
 class Silent : public RtpHandler {
 public:
-    void on_packet(RtpSession&, const RtpPacket&, const Address&) override {}
+    void on_packet(RtpSession&, const RtpPacket&, const Endpoint&) override {}
 };
 
 int g_fail = 0;
@@ -70,16 +69,14 @@ int main(int argc, char** argv)
         return 2;
     }
 
-    if (!netmech::initialize(2)) {
-        std::fprintf(stderr, "netmech initialize failed\n");
-        return 1;
-    }
+    // 不调 netmech::initialize()：io 线程数默认取 CPU 核数。
+    // 想压线程数时先 #include <netmech/common.hpp> 再 initialize(n)。
 
     std::error_code ec;
 
     // ---- 接收端 ----
     RtpSessionConfig rx_cfg;
-    rx_cfg.local        = Address("127.0.0.1", 0);
+    rx_cfg.local        = Endpoint("127.0.0.1", 0);
     rx_cfg.payload_type = 96;
     rx_cfg.clock_rate   = 90000;
 
@@ -92,7 +89,7 @@ int main(int argc, char** argv)
 
     // ---- 发送端：25 fps @ 90 kHz → 增量 3600 ----
     RtpSessionConfig tx_cfg = rx_cfg;
-    tx_cfg.remote              = Address("127.0.0.1", rx->local_rtp_port());
+    tx_cfg.remote              = Endpoint("127.0.0.1", rx->local_rtp_port());
     tx_cfg.timestamp_increment = 3600;
 
     auto tx = RtpSession::create(tx_cfg, std::make_shared<Silent>(), ec);
@@ -164,7 +161,6 @@ int main(int argc, char** argv)
 
     tx->close();
     rx->close();
-    netmech::shutdown();
 
     std::printf("\n%s\n", g_fail == 0 ? "PASS" : "FAIL");
     return g_fail == 0 ? 0 : 1;

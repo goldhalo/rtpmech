@@ -36,7 +36,7 @@ using namespace rtpmech;
 
 class Player : public RtpHandler {
 public:
-    void on_packet(RtpSession&, const RtpPacket& pkt, const netmech::Address& from) override
+    void on_packet(RtpSession&, const RtpPacket& pkt, const rtpmech::Endpoint& from) override
     {
         // ★ pkt 是借用视图：只在本次回调内有效，要延后处理请自己拷 payload
         std::printf("seq=%u ts=%u len=%zu from=%s\n",
@@ -47,10 +47,11 @@ public:
 };
 
 int main() {
-    netmech::initialize(2);
+    // 不需要 netmech：io 线程数默认取 CPU 核数
+
 
     RtpSessionConfig cfg;
-    cfg.local      = netmech::Address("0.0.0.0", 5000);   // RTCP 自动用 5001
+    cfg.local      = rtpmech::Endpoint("0.0.0.0", 5000);   // RTCP 自动用 5001
     cfg.clock_rate = 90000;
 
     std::error_code ec;
@@ -71,8 +72,8 @@ int main() {
 
 ```cpp
 RtpSessionConfig cfg;
-cfg.local               = netmech::Address("0.0.0.0", 0);      // 系统分配，保证偶数
-cfg.remote              = netmech::Address("192.168.1.10", 5000);
+cfg.local               = rtpmech::Endpoint("0.0.0.0", 0);      // 系统分配，保证偶数
+cfg.remote              = rtpmech::Endpoint("192.168.1.10", 5000);
 cfg.timestamp_increment = 3600;                                  // 25 fps @ 90 kHz
 
 auto sess = RtpSession::create(cfg, std::make_shared<Silent>(), ec);
@@ -312,8 +313,14 @@ target_link_libraries(app PRIVATE rtpmech::rtpmech)
 ```
 
 `librtpmech.a + libnetmech.a + pthread` 不用手写，导入的 target 全带着。
-注意 `rtpmech/session.hpp` 暴露了 `netmech::Address` / `netmech::UdpEndpoint`，
-所以 netmech 包是必需的。
+
+**头层面不依赖 netmech**：`include/rtpmech/*.hpp` 里没有 `#include <netmech/...>`，
+地址用 `rtpmech::Endpoint`、载荷用 `rtpmech::ConstBuf`。所以编译本库的消费者
+不需要把 netmech 的头挂进 include 路径；**链接**时需要 `libnetmech.a`
+（`find_package(rtpmech)` 会自动带出来）。
+
+想控制 io 线程数（默认 = CPU 核数）或与同进程其它库共用一份线程池，
+先 `#include <netmech/common.hpp>` 调一次 `netmech::initialize(n)`。
 
 > **安装约定（五个 mech 库统一）**：一个包只装自己，依赖由
 > `Config.cmake` 里的 `find_dependency` 声明、由使用者自己装。

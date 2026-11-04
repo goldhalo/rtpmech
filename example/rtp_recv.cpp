@@ -10,7 +10,6 @@
 // =============================================================================
 #include <rtpmech/rtpmech.hpp>
 
-#include <netmech/net.hpp>
 
 #include <atomic>
 #include <chrono>
@@ -20,7 +19,7 @@
 #include <thread>
 
 using namespace rtpmech;
-using netmech::Address;
+using rtpmech::Endpoint;
 
 namespace {
 
@@ -30,7 +29,7 @@ void on_sigint(int) { g_stop.store(true); }
 
 class Printer : public RtpHandler {
 public:
-    void on_packet(RtpSession&, const RtpPacket& pkt, const Address& from) override
+    void on_packet(RtpSession&, const RtpPacket& pkt, const Endpoint& from) override
     {
         // ★ pkt 只在本次回调内有效：想延后处理必须自己拷 payload
         std::printf("seq=%-5u ts=%-10u ssrc=%08X pt=%-3u len=%-5zu from=%s\n",
@@ -53,14 +52,12 @@ int main(int argc, char** argv)
     const std::uint16_t port =
         (argc > 1) ? static_cast<std::uint16_t>(std::atoi(argv[1])) : 5000;
 
-    if (!netmech::initialize(2)) {
-        std::fprintf(stderr, "netmech initialize failed\n");
-        return 1;
-    }
+    // 不调 netmech::initialize()：io 线程数默认取 CPU 核数。
+    // 想压线程数时先 #include <netmech/common.hpp> 再 initialize(n)。
     std::signal(SIGINT, on_sigint);
 
     RtpSessionConfig cfg;
-    cfg.local        = Address("0.0.0.0", port);
+    cfg.local        = Endpoint("0.0.0.0", port);
     cfg.payload_type = 96;
     cfg.clock_rate   = 90000;
 
@@ -69,8 +66,7 @@ int main(int argc, char** argv)
     auto sess = RtpSession::create(cfg, printer, ec);
     if (!sess) {
         std::fprintf(stderr, "create: %s\n", ec.message().c_str());
-        netmech::shutdown();
-        return 1;
+            return 1;
     }
 
     std::printf("listening  rtp=%u  rtcp=%u  ssrc=%08X\n",
@@ -96,6 +92,5 @@ int main(int argc, char** argv)
     }
 
     sess->close();          // 会发 BYE
-    netmech::shutdown();
     return 0;
 }

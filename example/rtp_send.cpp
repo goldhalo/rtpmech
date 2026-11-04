@@ -10,7 +10,6 @@
 // =============================================================================
 #include <rtpmech/rtpmech.hpp>
 
-#include <netmech/net.hpp>
 
 #include <chrono>
 #include <cstdio>
@@ -19,14 +18,14 @@
 #include <vector>
 
 using namespace rtpmech;
-using netmech::Address;
+using rtpmech::Endpoint;
 
 namespace {
 
 /// 只发不收：on_packet 是纯虚，必须实现，但发送端通常收不到包。
 class Silent : public RtpHandler {
 public:
-    void on_packet(RtpSession&, const RtpPacket&, const Address&) override {}
+    void on_packet(RtpSession&, const RtpPacket&, const Endpoint&) override {}
 };
 
 } // namespace
@@ -47,14 +46,12 @@ int main(int argc, char** argv)
         return 2;
     }
 
-    if (!netmech::initialize(2)) {
-        std::fprintf(stderr, "netmech initialize failed\n");
-        return 1;
-    }
+    // 不调 netmech::initialize()：io 线程数默认取 CPU 核数。
+    // 想压线程数时先 #include <netmech/common.hpp> 再 initialize(n)。
 
     RtpSessionConfig cfg;
-    cfg.local               = Address("0.0.0.0", 0);          // 系统分配，保证偶数
-    cfg.remote              = Address(dst_ip, dst_port);
+    cfg.local               = Endpoint("0.0.0.0", 0);          // 系统分配，保证偶数
+    cfg.remote              = Endpoint(dst_ip, dst_port);
     cfg.payload_type        = 96;
     cfg.clock_rate          = 90000;
     // 关键：时间戳增量由**帧率**决定，不是"发送时刻"
@@ -65,8 +62,7 @@ int main(int argc, char** argv)
     auto sess = RtpSession::create(cfg, std::make_shared<Silent>(), ec);
     if (!sess) {
         std::fprintf(stderr, "create: %s\n", ec.message().c_str());
-        netmech::shutdown();
-        return 1;
+            return 1;
     }
 
     std::printf("sending to %s:%u  rtp=%u rtcp=%u  ssrc=%08X  %d fps  %d frames\n",
@@ -106,6 +102,5 @@ int main(int argc, char** argv)
                 (unsigned long long)st.rtcp_sent);
 
     sess->close();      // 发 BYE
-    netmech::shutdown();
     return 0;
 }

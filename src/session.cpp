@@ -15,6 +15,7 @@
 //    用发送时刻会把编码延迟与调度抖动写进时间戳，播放端会抖。
 //  * **端口成对绑定**：RTP 偶数端口，RTCP = RTP + 1；任一失败则整体回滚。
 // =============================================================================
+#include "net_bridge.hpp"
 #include "rtpmech/session.hpp"
 
 #include <atomic>
@@ -162,7 +163,7 @@ public:
             const std::uint16_t rtcp_port = static_cast<std::uint16_t>(rtp_port_ + 1);
 
             netmech::UdpConfig rtcp_cfg;
-            rtcp_cfg.bind          = netmech::Address(cfg_.local.address_string(), rtcp_port);
+            rtcp_cfg.bind          = netmech::Address(cfg_.local.host(), rtcp_port);
             rtcp_cfg.recv_capacity = std::max<std::size_t>(cfg_.recv_capacity, 64);
 
             rtcp_ep_ = netmech::create_udp_endpoint_on(
@@ -221,7 +222,7 @@ public:
 
         // 回调里 pkt 是借用视图，返回即失效
         if (handler_ && facade_ != nullptr) {
-            handler_->on_packet(*facade_, *pkt, from);
+            handler_->on_packet(*facade_, *pkt, detail::from_address(from));
         }
     }
 
@@ -240,7 +241,7 @@ public:
         rtcp_received_.fetch_add(1, std::memory_order_relaxed);
 
         if (handler_ && facade_ != nullptr) {
-            handler_->on_rtcp(*facade_, *compound, from);
+            handler_->on_rtcp(*facade_, *compound, detail::from_address(from));
         }
     }
 
@@ -248,9 +249,9 @@ public:
     //  发送
     // -------------------------------------------------------------------------
 
-    SendResult send_payload(netmech::ConstBuf payload, bool marker,
+    SendResult send_payload(rtpmech::ConstBuf payload, bool marker,
                             const std::optional<std::uint32_t>& ts_override,
-                            const std::optional<netmech::Address>& dst_override)
+                            const std::optional<Endpoint>& dst_override)
     {
         if (!open_.load(std::memory_order_acquire)) {
             return SendResult::closed;
@@ -284,9 +285,9 @@ public:
 
         netmech::Address dst;
         if (dst_override.has_value()) {
-            dst = *dst_override;
+            dst = detail::to_address(*dst_override);
         } else if (cfg_.remote.has_value()) {
-            dst = *cfg_.remote;
+            dst = detail::to_address(*cfg_.remote);
         }
         if (dst.port() == 0) {
             return SendResult::invalid;   // 既没配 remote 也没给 dst
@@ -500,10 +501,14 @@ private:
     bool try_bind_rtp(std::uint16_t port, std::error_code& ec)
     {
         netmech::UdpConfig cfg;
-        cfg.bind                = netmech::Address(cfg_.local.address_string(), port);
+        cfg.bind                = netmech::Address(cfg_.local.host(), port);
         cfg.recv_capacity       = std::max<std::size_t>(cfg_.recv_capacity, 64);
-        cfg.multicast_group     = cfg_.multicast_group;
-        cfg.multicast_interface = cfg_.multicast_interface;
+        if (cfg_.multicast_group) {
+            cfg.multicast_group = detail::to_address(*cfg_.multicast_group);
+        }
+        if (cfg_.multicast_interface) {
+            cfg.multicast_interface = detail::to_address(*cfg_.multicast_interface);
+        }
         cfg.multicast_hops      = cfg_.multicast_hops;
         cfg.multicast_loopback  = cfg_.multicast_loopback;
 
@@ -526,7 +531,7 @@ private:
         if (!rtcp_ep_ || !cfg_.remote.has_value()) {
             return false;
         }
-        const netmech::Address dst(cfg_.remote->address_string(),
+        const netmech::Address dst(cfg_.remote->host(),
                                    static_cast<std::uint16_t>(cfg_.remote->port() + 1));
 
         // 缓冲随 owner 交给库，保证活到真正发出
@@ -659,7 +664,7 @@ std::shared_ptr<RtpSession> RtpSession::create(const RtpSessionConfig&     cfg,
     return session;
 }
 
-SendResult RtpSession::send(netmech::ConstBuf payload, bool marker)
+SendResult RtpSession::send(ConstBuf payload, bool marker)
 {
     if (!impl_) {
         return SendResult::closed;
@@ -667,7 +672,7 @@ SendResult RtpSession::send(netmech::ConstBuf payload, bool marker)
     return impl_->send_payload(payload, marker, std::nullopt, std::nullopt);
 }
 
-SendResult RtpSession::send_with_timestamp(netmech::ConstBuf payload, bool marker,
+SendResult RtpSession::send_with_timestamp(ConstBuf payload, bool marker,
                                            std::uint32_t timestamp)
 {
     if (!impl_) {
@@ -676,8 +681,7 @@ SendResult RtpSession::send_with_timestamp(netmech::ConstBuf payload, bool marke
     return impl_->send_payload(payload, marker, timestamp, std::nullopt);
 }
 
-SendResult RtpSession::send_to(const netmech::Address& dst,
-                               netmech::ConstBuf payload, bool marker)
+SendResult RtpSession::send_to(const Endpoint& dst, ConstBuf payload, bool marker)
 {
     if (!impl_) {
         return SendResult::closed;
