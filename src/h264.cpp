@@ -14,8 +14,12 @@ constexpr std::size_t kRtpHeaderSize = 12;
 
 /// H.264 NAL 类型（RFC 6184 §5.4 + RFC 6184 表 1）。
 constexpr std::uint8_t kFuA        = 28;   ///< FU-A（分片单元 A）
-constexpr std::uint8_t kStapA      = 24;   ///< STAP-A（聚合包）
-constexpr std::uint8_t kNalTypeMax = 23;   ///< 1~23 是单个 NAL 单元
+/// STAP-A（聚合包）。本库只做"拆包"不做"装箱"，所以这个常量目前没有使用点 ——
+/// 留着是为了让下面的类型判断表能一眼对上 RFC，标 maybe_unused 免得 clang 报
+/// -Wunused-const-variable（gcc 在 C++ 下不会报，所以本地一直是绿的）。
+[[maybe_unused]] constexpr std::uint8_t kStapA = 24;
+/// 1~23 是单个 NAL 单元。当前只判 FU-A，用不到上界，留作对照表。
+[[maybe_unused]] constexpr std::uint8_t kNalTypeMax = 23;
 
 /// Annex-B 起始码长度（4 字节或 3 字节）。
 std::size_t start_code_len(span<const std::uint8_t> b, std::size_t i) noexcept

@@ -11,7 +11,8 @@ namespace {
 
 constexpr std::size_t kRtpHeaderSize = 12;
 constexpr std::uint8_t kFu  = 49;   ///< FU（分片单元）
-constexpr std::uint8_t kAp  = 48;   ///< AP（聚合包）
+/// AP（聚合包）。只拆包不装箱，暂无使用点，留作对照表。
+[[maybe_unused]] constexpr std::uint8_t kAp = 48;
 
 /// H.265 参数集类型（RFC 7798 §1.1.4）
 constexpr std::uint8_t kVps = 32;
