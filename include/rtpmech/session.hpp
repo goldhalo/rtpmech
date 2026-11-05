@@ -122,6 +122,21 @@ struct RtpSessionConfig {
     /// 关闭后只剩 RTP 单端口（P+1 不会被绑定，可能被别的进程占用）。
     bool enable_rtcp = true;
 
+    /// RTCP SDES 里上报的 CNAME（RFC 3550 §6.5.1）。
+    ///
+    /// `CNAME` 是把"同一逻辑实体的多个 SSRC"串起来的唯一纽带：它应当
+    /// **跨会话重启保持稳定**（推荐 `user@hostname` 这类可读、少变的形式），
+    /// 而不是绑在 SSRC 上 —— SSRC 会因为冲突换号（§8.2），CNAME 换了，
+    /// 对端就无法把前后两条流归并成一路。
+    ///
+    /// - 空（默认）：本会话生成 `rtpmech-XXXXXXXX`，**会话内稳定**（换 SSRC 不变），
+    ///   但进程重启会变；
+    /// - 非空：原样使用。需要"重启后仍能归并"的场景（录制、对账）请显式配置。
+    ///
+    /// @note 长度上限 255 字节（SDES item 的 len 是单字节），超了 `create()` 报
+    ///       `invalid_argument` —— 不会被静默截断。
+    std::string cname;
+
     /// 会话带宽（bps），用于计算 RTCP 发送间隔（RFC 3550 §6.2）。
     /// `0` 表示使用默认值。
     double session_bandwidth = 0.0;

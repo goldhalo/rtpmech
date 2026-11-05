@@ -48,6 +48,18 @@ namespace {
 using steady_clock_t = std::chrono::steady_clock;
 
 /// 生成 SSRC / 初始时间戳（RFC 3550 §5.1 要求不可预测）。
+/// 源失活超时：RFC 3550 §6.3.5 建议 5 个报告间隔。
+/// 默认 RTCP 间隔 5s ⇒ 25s；这里固定成常量，不随会话带宽调整
+/// （带宽变了只会让间隔更长，超时放宽一点没有坏处）。
+constexpr std::int64_t kSourceTimeoutUs = 25 * 1000 * 1000;
+
+std::string make_default_cname(std::uint32_t ssrc)
+{
+    char buf[32];
+    std::snprintf(buf, sizeof buf, "rtpmech-%08x", ssrc);
+    return buf;
+}
+
 std::uint32_t gen_random32() noexcept
 {
     const auto now = static_cast<std::uint64_t>(steady_clock_t::now().time_since_epoch().count());
@@ -90,14 +102,29 @@ constexpr int kMaxAutoPortAttempts = 32;
 class RtpSession::Impl : public std::enable_shared_from_this<RtpSession::Impl> {
 public:
     explicit Impl(const RtpSessionConfig& config)
+        : Impl(config, config.local_ssrc != 0 ? config.local_ssrc : gen_random32())
+    {
+    }
+
+    /// @param[in] ssrc 本会话的 SSRC（配置值或随机生成，**已经定好**）。
+    ///
+    /// 为什么要拆一层委托构造：以前 `ssrc_` 是随机的，而传给 `tracker_` 的是
+    /// `config.local_ssrc != 0 ? ... : 0` —— 一旦用随机 SSRC，tracker 就认为
+    /// 本端 SSRC 未知（0），`on_receiver_report()` 第一条判据
+    /// `local_ssrc_ == 0` 直接把所有 RR 跳过 ⇒ RTT 永远算不出来。
+    /// 两个对象必须拿到**同一个**值，所以在这里一次算好。
+    Impl(const RtpSessionConfig& config, std::uint32_t ssrc)
         : cfg_(config)
-        , ssrc_(config.local_ssrc != 0 ? config.local_ssrc : gen_random32())
+        , ssrc_(ssrc)
         , ts_base_(gen_random32())
         , ts_current_(ts_base_)
         , ts_increment_(config.timestamp_increment)
-        , tracker_(config.local_ssrc != 0 ? config.local_ssrc : 0, config.clock_rate)
+        , tracker_(ssrc, config.clock_rate)
         , scheduler_(make_scheduler_params(config))
     {
+        // CNAME 与本会话绑定，**不跟 SSRC 走**：SSRC 因冲突换号时它保持不变，
+        // 对端才能把前后两条流归并到同一个逻辑实体（RFC 3550 §6.5.1）。
+        cname_ = cfg_.cname.empty() ? make_default_cname(ssrc) : cfg_.cname;
     }
 
     ~Impl()
@@ -202,7 +229,11 @@ public:
 
         scheduler_.set_session_bandwidth(
             cfg_.session_bandwidth > 0.0 ? cfg_.session_bandwidth / 8.0 : 0.0);
-        scheduler_.update_members(1, 1);
+        // 初始只有本端一个成员（还没有远端源、也还没发过包 ⇒ 不是 sender）。
+        // 真正的值每拍由 send_rtcp() 按 tracker_ 的实际内容刷新 ——
+        // 这里以前写死 (1, 1)，等于告诉调度器"场上两个人、两个都在发"，
+        // 带宽份额从一开始就分错了。
+        scheduler_.update_members(1, 0);
         scheduler_.reset(steady_now_sec());
 
         first_send_time_ = steady_clock_t::now();
@@ -240,6 +271,7 @@ public:
 
         rtp_received_.fetch_add(1, std::memory_order_relaxed);
         tracker_.on_rtp_received(*pkt, steady_now_us());
+        sync_tracker_stats();
 
         // 回调里 pkt 是借用视图，返回即失效
         if (handler_ && facade_ != nullptr) {
@@ -260,6 +292,28 @@ public:
             return;
         }
         rtcp_received_.fetch_add(1, std::memory_order_relaxed);
+
+        // ★ 先把报文喂给源跟踪器。
+        //
+        //   这一步以前**完全缺失** —— 收到 RTCP 只是 parse 完递给应用回调，
+        //   tracker_ 一个成员都没调。于是 RFC 3550 §6 的"双向报告闭环"整条断掉：
+        //     · 收不到对端 SR ⇒ 我方报告块的 LSR/DLSR 恒 0 ⇒ **对端**算不出 RTT；
+        //     · 收不到对端 RR ⇒ 我方 rtt_us() 恒 nullopt；
+        //     · BYE 不移除源 ⇒ 已退出的源永远留在 map 和报告块里（31 个上限一到，
+        //       活着的源反而被挤出去）。
+        //   单测测不出来：test_source_tracker 直接 new tracker 测算法，
+        //   test_session 只看 rtcp_sent/received 计数，从不看报文内容。
+        const std::int64_t now_us = steady_now_us();
+        for (const RtcpPacket& pkt : compound->packets()) {
+            if (const SenderReport* sr = pkt.as_sender_report()) {
+                tracker_.on_sender_report(*sr, now_us);
+            } else if (const ReceiverReport* rr = pkt.as_receiver_report()) {
+                tracker_.on_receiver_report(*rr, now_us);
+            } else if (const ByeReport* bye = pkt.as_bye()) {
+                tracker_.on_bye(*bye);
+            }
+        }
+        sync_tracker_stats();
 
         if (handler_ && facade_ != nullptr) {
             handler_->on_rtcp(*facade_, *compound, detail::from_address(from));
@@ -324,6 +378,36 @@ public:
             fn();
         }
         return true;
+    }
+
+    /// 对外入口：发 BYE（可选顺带关闭会话）。
+    ///
+    /// 与 `post_send` / `post_rtcp_now` 同构 —— 以前门面直接就地调
+    /// `send_bye()`，而它要读 `rtcp_ep_`、发 UDP、动 `ssrc_`，这些都在
+    /// io 线程上被 `do_close()` 改，是标准的"检查后再用"竞态。
+    ///
+    /// `allow_inline=false`：BYE 必须排在已投递的发送之后（先让数据出去、再告别），
+    /// 而且在 io 线程上调用时也不能插到前面去。`close_after` 在同一任务里串着做，
+    /// 保证"BYE 一定先于关闭"。
+    void post_bye(std::string reason, bool close_after)
+    {
+        auto self = weak_from_this().lock();
+        if (!self) {
+            return;
+        }
+        auto fn = [self, reason = std::move(reason), close_after]() mutable {
+            if (self->open_.load(std::memory_order_acquire)) {
+                self->send_bye(reason);
+            }
+            if (close_after) {
+                Impl::request_close(self);
+            }
+        };
+        if (post_) {
+            post_(std::move(fn), /*allow_inline=*/false);
+        } else {
+            fn();
+        }
     }
 
     SendResult send_payload(rtpmech::ConstBuf payload, bool marker,
@@ -395,40 +479,75 @@ public:
             return true;   // 未到期
         }
 
+        // 顺手清理失活源（RFC 3550 §6.3.5：5 个报告间隔无活动即可超时）。
+        // 以前这一步从没被调用过 —— 长期会话里 map 只增不减，报告块也会被
+        // 僵尸源占满（31 个的上限一到，活着的源反而被挤出去）。
+        (void)tracker_.expire_inactive(steady_now_us(), kSourceTimeoutUs);
+
+        // 参与者数喂给调度器：它据此算共享带宽份额与自适应间隔。
+        // 以前写死 (1, 1) —— 调度算法本身是对的（rtcp_scheduler.cpp），
+        // 但没有输入，退化成固定间隔。members 含本端自己。
+        scheduler_.update_members(tracker_.size() + 1,
+                                  tracker_.sender_count() + 1);
+        sync_tracker_stats();
+
         const auto blocks = tracker_.build_report_blocks();
 
         std::vector<std::uint8_t> buf(cfg_.max_packet_size, 0);
         std::size_t off = 0;
         std::error_code ec;
 
-        SenderReport sr;
-        sr.ssrc = ssrc_.load(std::memory_order_acquire);
-        {
-            const auto now_wall = std::chrono::system_clock::now();
-            const auto secs = std::chrono::duration_cast<std::chrono::seconds>(
-                                  now_wall.time_since_epoch()).count();
-            const auto nanos = std::chrono::duration_cast<std::chrono::nanoseconds>(
-                                   now_wall.time_since_epoch()).count() % 1000000000LL;
-            const NtpTime ntp = make_ntp_time(secs, static_cast<std::uint32_t>(nanos));
-            sr.ntp_msw       = ntp.seconds;
-            sr.ntp_lsw       = ntp.fraction;
-            sr.rtp_timestamp = current_timestamp();
-            sr.packet_count  = static_cast<std::uint32_t>(rtp_sent_.load());
-            sr.octet_count   = static_cast<std::uint32_t>(octet_sent_.load());
-        }
-        sr.reports = blocks;
+        const std::uint32_t local_ssrc = ssrc_.load(std::memory_order_acquire);
 
-        const std::size_t n_sr = build_rtcp_sender_report(buf.data(), buf.size(), sr, ec);
-        if (ec) {
-            return false;
-        }
-        off += n_sr;
+        // ★ RFC 3550 §6.4：自上次报告以来**没发过数据**的一方应当发 RR。
+        //   以前无条件发 SR —— 只收不发的会话（典型：监控端 / 纯播放端）会把
+        //   自己伪装成发送者，污染对端的 sender_count，进而算错 25%/75%
+        //   的 RTCP 带宽配额。build_rtcp_receiver_report 早就写好了，只是没人用。
+        const bool is_sender = rtp_sent_.load(std::memory_order_relaxed) > 0;
 
-        // 复合包里附带 SDES(CNAME)：RFC 3550 要求 CNAME 稳定且可读
+        NtpTime local_sr_ntp{};
+        if (is_sender) {
+            SenderReport sr;
+            sr.ssrc = local_ssrc;
+            {
+                const auto now_wall = std::chrono::system_clock::now();
+                const auto secs = std::chrono::duration_cast<std::chrono::seconds>(
+                                      now_wall.time_since_epoch()).count();
+                const auto nanos = std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                       now_wall.time_since_epoch()).count() % 1000000000LL;
+                local_sr_ntp     = make_ntp_time(secs, static_cast<std::uint32_t>(nanos));
+                sr.ntp_msw       = local_sr_ntp.seconds;
+                sr.ntp_lsw       = local_sr_ntp.fraction;
+                sr.rtp_timestamp = current_timestamp();
+                sr.packet_count  = static_cast<std::uint32_t>(rtp_sent_.load());
+                sr.octet_count   = static_cast<std::uint32_t>(octet_sent_.load());
+            }
+            sr.reports = blocks;
+
+            const std::size_t n = build_rtcp_sender_report(buf.data(), buf.size(), sr, ec);
+            if (ec) {
+                return false;
+            }
+            off += n;
+        } else {
+            ReceiverReport rr;
+            rr.ssrc    = local_ssrc;
+            rr.reports = blocks;
+
+            const std::size_t n =
+                build_rtcp_receiver_report(buf.data(), buf.size(), rr, ec);
+            if (ec) {
+                return false;
+            }
+            off += n;
+        }
+
+        // 复合包里附带 SDES(CNAME)：RFC 3550 要求 CNAME 稳定且可读。
+        // cname_ 在构造时定好，**不随 SSRC 变化**。
         SdesReport sdes;
         SdesChunk chunk;
-        chunk.ssrc  = sr.ssrc;
-        chunk.cname = "rtpmech-" + std::to_string(sr.ssrc);
+        chunk.ssrc  = local_ssrc;
+        chunk.cname = cname_;
         sdes.chunks.push_back(chunk);
 
         const std::size_t n_sdes =
@@ -441,9 +560,40 @@ public:
         if (!send_on_rtcp(buf, off)) {
             return false;
         }
+
+        // ★ 记下"我刚发过 SR"，供对端 RR 里的 lsr 匹配后算 RTT。
+        //   以前 on_local_sr_sent 有实现、**没有调用点** —— 这是 RTT 永远
+        //   nullopt 的最后一块拼图。
+        //
+        //   传的是 **LSR 形式**（NTP 中间 32 位），不是高 32 位：对端在 RR 里
+        //   回填的 rb.lsr 就是中间 32 位（§6.4.1），两边必须同构，否则永远匹配不上。
+        if (is_sender) {
+            const std::uint32_t sr_lsr =
+                (local_sr_ntp.seconds << 16) | (local_sr_ntp.fraction >> 16);
+            tracker_.on_local_sr_sent(sr_lsr, steady_now_us());
+            sync_tracker_stats();
+        }
+
         // 告诉调度器"发出去了、多大"，它据此更新平均包大小并排下一拍
         scheduler_.on_rtcp_sent(off, steady_now_sec());
         return true;
+    }
+
+    /// 把 tracker 里"对外可见"的统计刷到原子镜像（**只在 io 线程调**）。
+    ///
+    /// `tracker_` 是 std::map，按约定只在 io 线程上碰；而 `stats()` 是公开
+    /// 方法、典型用法就是在另一个线程打日志/采集 —— 直接 `tracker_.size()`
+    /// 是与收包路径（插树）并发的无同步读，属于 UB。所以每次 tracker 变化后
+    /// 把这两个数复制到原子变量，`stats()` 只读原子。
+    ///
+    /// 快照语义：两个字段各自独立更新，不保证属于同一瞬间（统计用途足够）。
+    void sync_tracker_stats() noexcept
+    {
+        active_sources_.store(tracker_.size(), std::memory_order_relaxed);
+        if (const auto rtt = tracker_.rtt_us()) {
+            rtt_us_.store(*rtt, std::memory_order_relaxed);
+            rtt_valid_.store(true, std::memory_order_relaxed);
+        }
     }
 
     void schedule_rtcp()
@@ -560,8 +710,13 @@ public:
         st.rtcp_received  = rtcp_received_.load(std::memory_order_relaxed);
         st.send_rejected  = send_rejected_.load(std::memory_order_relaxed);
         st.parse_errors   = parse_errors_.load(std::memory_order_relaxed);
-        st.active_sources = tracker_.size();
-        st.rtt_us         = tracker_.rtt_us();
+        // ★ 只读原子镜像，不碰 tracker_（std::map，只在 io 线程上访问）。
+        //   以前这里直接 `tracker_.size()` / `rtt_us()` —— 与收包路径插树并发，
+        //   是无同步读 map，属于 UB。测试没发现是因为都在流量停止后才查。
+        st.active_sources = active_sources_.load(std::memory_order_relaxed);
+        if (rtt_valid_.load(std::memory_order_relaxed)) {
+            st.rtt_us = rtt_us_.load(std::memory_order_relaxed);
+        }
         return st;
     }
 
@@ -605,7 +760,13 @@ private:
             // 给了区间：用分配器挑一对（游标续着走，不每次从头扫）
             auto alloc = allocator_for(static_cast<std::uint16_t>(round_up_even(want)),
                                        cfg_.rtp_port_end);
-            // 探测与真正 bind 之间有极小窗口，撞上了就再要一对（最多 8 次）
+            // 探测与真正 bind 之间有极小窗口，撞上了就再要一对（最多 8 次）。
+            //
+            // 这里**不调 `alloc->release()`**：`PortAllocator` 刻意不维护引用计数
+            // （见其 `release()` 的实现——只做参数校验，什么都不改），"端口可用"
+            // 完全靠实时探测。而且 acquire 成功会把游标推到本组之后，所以下一轮
+            // 拿的是**下一对**，不会反复撞同一对。报告里"没 release 会蚕食区间"
+            // 的说法基于"release 会记账"的假设，实际不成立。
             for (int attempt = 0; attempt < 8; ++attempt) {
                 const auto first = alloc->acquire(/*count=*/2, /*alignment=*/2);
                 if (!first.has_value()) {
@@ -708,20 +869,30 @@ private:
 
     void on_ssrc_collision(const netmech::Address& from)
     {
-        // 同一来源重复出现不算冲突（自己的包回环）
-        const std::string key = from.to_string();
+        // 同一来源**针对同一个 SSRC** 重复出现才算"已处理过"（自己的包回环）。
+        //
+        //   键里带上当前 SSRC：以前只用地址做键，于是"从同一台设备发起的第二次
+        //   真实冲突"会被永久忽略 —— 对方换了号、我们这边也换过号之后再撞，
+        //   本该再处理一次。带 ssrc 之后，换了号就是一个新事件。
+        const std::uint32_t cur_ssrc = ssrc_.load(std::memory_order_acquire);
+        const std::string key =
+            from.to_string() + "#" + std::to_string(cur_ssrc);
         if (last_collision_from_ == key) {
             return;
         }
         last_collision_from_ = key;
 
-        const std::uint32_t old_ssrc = ssrc_.load(std::memory_order_acquire);
+        const std::uint32_t old_ssrc = cur_ssrc;
         // 已经用这个 SSRC 发过数据 → 先发 BYE 告知对端
         if (rtp_sent_.load(std::memory_order_relaxed) > 0) {
             send_bye({});
         }
         const std::uint32_t new_ssrc = gen_random32();
         ssrc_.store(new_ssrc, std::memory_order_release);
+        // ★ tracker 里的 local_ssrc 也要跟着换：它用这个值把"自己发的包"和
+        //   "报告我的 RR 块"挑出来。不同步的话，换号之后 RTT 匹配就断了，
+        //   而且对端报告块里针对旧号的条目会被当成别的源。
+        tracker_.set_local_ssrc(new_ssrc);
 
         std::printf("[rtpmech] SSRC collision from %s: %08X -> %08X\n",
                     from.to_string().c_str(), old_ssrc, new_ssrc);
@@ -755,19 +926,20 @@ private:
     RtpSessionConfig cfg_;
     RtpSession*      facade_ = nullptr;
 
-    // ★ 端点对象会被**两个线程**同时碰：
-    //   · close() 可能由应用线程调（RtpSession::close 对外是线程安全的）；
-    //   · send/send_rtcp/send_bye 可能来自应用线程（send_* 允许任意线程），
-    //     也可能来自端点自己的 io 线程（定时器）。
-    //   直接 `if (!ep) ep->foo()` 是"检查后再用"的典型竞态 ——
-    //   检查通过后另一线程 reset，就变成空指针成员调用（UBSan 会直接报）。
-    //   所以统一走下面两个访问器：锁内拷一份 shared_ptr 出来用。
-    // ★ RTCP 的状态（source_tracker + 发送调度器）会被两处同时碰：
-    //   · 端点定时器（io 线程）→ send_rtcp / schedule_rtcp；
-    //   · 应用线程 → send_rtcp_now() / stats()；
-    //   把这堆状态用一把锁护住。RTP 收包路径也要进来（更新 tracker）。
-    // ★ 可变状态（端点、tracker、调度器、序号）**只在端点的 io 线程上碰**。
-    //   公开 API 从别的线程进来先 post_ 过去，于是全程无锁。
+    // ★ 线程模型（唯一的规矩，别再加第二条）：
+    //
+    //   可变状态（两个端点、source_tracker、调度器、RTP 序号/时间戳）**只在
+    //   RTP 端点所属的 io 线程上碰**。所有公开 API（send* / send_rtcp_now /
+    //   send_bye / close）都先把活儿 post_ 到那个线程上，于是全程无锁。
+    //
+    //   因此下面这些成员"看起来是裸的"，但访问它们的线程只有一个：
+    //     · send_bye() 由 io 线程调（门面 post 过来 / 冲突处理内部调）；
+    //     · send_rtcp() 由定时器回调调（同一个 io 线程）；
+    //     · do_close() 也是 post 过来的。
+    //   唯一从别的线程读的是 `stats()` —— 它只读 atomic 镜像
+    //   （active_sources_ / rtt_us_），不碰 tracker_。
+    //
+    //   ⚠ 加新的公开方法时，记得先 post_；直接碰上面这些成员就是数据竞争。
     std::function<void(std::function<void()>, bool)> post_;
     std::shared_ptr<netmech::UdpEndpoint> rtp_ep_;
     std::shared_ptr<netmech::UdpEndpoint> rtcp_ep_;
@@ -798,6 +970,15 @@ private:
     std::atomic<std::uint64_t> parse_errors_{0};
     std::atomic<std::uint64_t> octet_sent_{0};
 
+    // ---- 对外统计的原子镜像（见 sync_tracker_stats） ----
+    //   tracker_ 只能在 io 线程碰；stats() 从任意线程调，所以这两个数单独存。
+    std::atomic<std::size_t>   active_sources_{0};
+    std::atomic<std::uint32_t> rtt_us_{0};
+    std::atomic<bool>          rtt_valid_{false};
+
+    /// SDES CNAME：构造时定好，**不随 SSRC 变化**（RFC 3550 §6.5.1）。
+    std::string cname_;
+
     std::string last_collision_from_;
 };
 
@@ -826,6 +1007,12 @@ std::shared_ptr<RtpSession> RtpSession::create(const RtpSessionConfig&     cfg,
         return nullptr;
     }
     if (cfg.recv_capacity == 0 || cfg.max_packet_size < 64) {
+        ec = make_error_code(RtpErrc::invalid_argument);
+        return nullptr;
+    }
+    // SDES item 的 len 是单字节：> 255 无法表达。在这里拦住，比在 send_rtcp 里
+    // 每拍都失败一次好 —— 那种情况下 RTCP 会静默停发，日志里什么都看不到。
+    if (cfg.cname.size() > 255) {
         ec = make_error_code(RtpErrc::invalid_argument);
         return nullptr;
     }
@@ -880,7 +1067,14 @@ void RtpSession::send_bye(const std::string& reason, bool close_after)
         return;
     }
     if (impl_->is_open()) {
-        impl_->send_bye(reason);
+        // ★ 投递到 io 线程 —— 与 send / send_rtcp_now 同构。
+        //
+        //   以前这里就地 `impl_->send_bye(reason)`：它读 rtcp_ep_、发 UDP、
+        //   动 ssrc_，而 do_close() 在 io 线程上 `rtcp_ep_.reset()` ——
+        //   两个线程并发 copy/reset 同一个 shared_ptr，也是"检查后再用"的
+        //   标准竞态（头文件写着 send_bye 可从任意线程调）。
+        impl_->post_bye(reason, close_after);
+        return;
     }
     if (close_after) {
         Impl::request_close(impl_);

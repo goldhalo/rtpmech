@@ -154,9 +154,13 @@ public:
 
     /// 记录本地发出的 SR（用于后续 RTT 计算）。
     ///
-    /// @param[in] ntp_msw   发出的 SR 的 NTP 高 32 位。
+    /// @param[in] sr_lsr    发出的 SR 的 **LSR 形式** —— NTP 时间戳的中间 32 位，
+    ///                      即 `(seconds << 16) | (fraction >> 16)`。
+    ///                      **不是** NTP 的高 32 位：对端在 RR 里回填的 `lsr`
+    ///                      就是这个中间 32 位（RFC 3550 §6.4.1），两边必须同构，
+    ///                      否则匹配永远失败、RTT 永远是 nullopt。
     /// @param[in] sent_us   发送时刻（steady_clock 微秒）。
-    void on_local_sr_sent(std::uint32_t ntp_msw, std::int64_t sent_us);
+    void on_local_sr_sent(std::uint32_t sr_lsr, std::int64_t sent_us);
 
     /// 清除超过 `timeout_us` 未活动的源（RFC 3550 建议 5 个报告间隔）。
     ///
@@ -178,6 +182,13 @@ public:
     /// 本地 SSRC。
     [[nodiscard]] std::uint32_t local_ssrc() const noexcept { return local_ssrc_; }
 
+    /// 更新本地 SSRC（SSRC 冲突换号时用）。
+    ///
+    /// 构造时如果拿不到 SSRC（传 0），`on_receiver_report()` 会把所有 RR 跳过
+    /// —— 它靠这个值挑"报告我的块"。所以会话层必须在**确定 SSRC 时**同步过来，
+    /// 换号时也要同步，否则 RTT 匹配立刻断掉。
+    void set_local_ssrc(std::uint32_t ssrc) noexcept { local_ssrc_ = ssrc; }
+
     /// 清空全部状态。
     void clear() noexcept;
 
@@ -187,12 +198,20 @@ public:
 private:
     SourceStats& get_or_create(std::uint32_t ssrc, std::int64_t now_us);
 
+    /// 从一组报告块里挑出"报告本端 SSRC"的那块算 RTT。
+    ///
+    /// SR 和 RR 都携带报告块（RFC 3550 §6.4.1），所以两个入口共用这一份逻辑
+    /// —— 只处理 RR 的话，双方都在发的会话永远算不出 RTT。
+    void handle_report_blocks(const std::vector<ReportBlock>& blocks,
+                              std::int64_t now_us);
+
     std::uint32_t                local_ssrc_;
     std::uint32_t                clock_rate_;
     std::map<std::uint32_t, SourceStats> sources_;
 
     // 本地 SR 记录（用于 RTT）
-    std::uint32_t local_last_sr_ntp_msw_ = 0;
+    /// 最近一次本地 SR 的 LSR 形式（NTP 中间 32 位），用来匹配对端 RR 里的 lsr。
+    std::uint32_t local_last_sr_lsr_ = 0;
     std::int64_t  local_last_sr_sent_us_ = 0;
     bool          has_local_sr_          = false;
     std::uint32_t local_rtt_us_          = 0;

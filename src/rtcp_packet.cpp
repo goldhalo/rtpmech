@@ -526,6 +526,19 @@ std::size_t rtcp_sdes_size(const SdesReport& sdes) noexcept
     }
     std::size_t n = kRtcpCommonHeaderSize;
     for (const auto& c : sdes.chunks) {
+        // ★ 每个 item 的 len 是**单字节**（RFC 3550 §6.5），超过 255 就无法表达。
+        //   以前靠 `static_cast<uint8_t>(size)` 静默取模：256 字节的 CNAME 会写成
+        //   len=0（对上端语义是 END），后面的字节被当成填充/下一段 —— 生成一个
+        //   结构完全错乱的复合包，而内存又是按全长拷进去的，buffer_too_small
+        //   检查根本不会触发。这种"能发出去但对方解不开"的包最难查。
+        if (c.cname.size() > 255) {
+            return 0;
+        }
+        for (const auto& it : c.items) {
+            if (it.second.size() > 255) {
+                return 0;
+            }
+        }
         n += sdes_chunk_bytes(c);
     }
     return n;
@@ -534,6 +547,10 @@ std::size_t rtcp_sdes_size(const SdesReport& sdes) noexcept
 std::size_t rtcp_bye_size(const ByeReport& bye) noexcept
 {
     if (bye.ssrcs.size() > 31) {
+        return 0;
+    }
+    // 同 SDES：reason 的长度字段是单字节，> 255 无法表达（取模会写出错乱的包）。
+    if (bye.reason.size() > 255) {
         return 0;
     }
     std::size_t n = kRtcpCommonHeaderSize + bye.ssrcs.size() * 4;
@@ -727,14 +744,21 @@ std::size_t build_rtcp_app(std::uint8_t* out, std::size_t cap,
 
 NtpTime make_ntp_time(std::int64_t unix_sec, std::uint32_t nano_sec) noexcept
 {
+    // ★ 先把纳秒归一到 [0, 1e9)：`nano_sec >= 1e9` 时 (nano << 32) / 1e9 会 ≥ 2^32，
+    //   强转 uint32_t 直接截断（1.5e9 变成 0.5s，也就是"往回跳了 1 秒"）。
+    //   内部调用方本来就做过 %1e9，但这是**公共 API**，直接传"秒 + 纳秒"的
+    //   调用者会踩雷。
+    const std::uint64_t carry = static_cast<std::uint64_t>(nano_sec) / 1000000000ULL;
+    const std::uint32_t nano  = nano_sec % 1000000000u;
+
     NtpTime t{};
     const std::uint64_t ntp_sec =
-        static_cast<std::uint64_t>(unix_sec) + kNtpUnixEpochOffset;
+        static_cast<std::uint64_t>(unix_sec + static_cast<std::int64_t>(carry))
+        + kNtpUnixEpochOffset;
     t.seconds = static_cast<std::uint32_t>(ntp_sec);
 
-    // 小数部分：(nano / 1e9) * 2^32
-    const std::uint64_t frac =
-        (static_cast<std::uint64_t>(nano_sec) << 32) / 1000000000ULL;
+    // 小数部分：(nano / 1e9) * 2^32，nano < 1e9 ⇒ frac < 2^32，不会溢出
+    const std::uint64_t frac = (static_cast<std::uint64_t>(nano) << 32) / 1000000000ULL;
     t.fraction = static_cast<std::uint32_t>(frac);
     return t;
 }

@@ -233,17 +233,28 @@ void SourceTracker::on_sender_report(const SenderReport& sr,
     st.last_sr_packet_count = sr.packet_count;
     st.last_sr_octet_count  = sr.octet_count;
     st.last_sr_recv_us      = arrival_us;
+
+    // ★ SR 里同样带报告块（RFC 3550 §6.4.1：SR = 发送者信息 + 0..31 个报告块）。
+    //   以前这里只记发送者信息、完全不看 reports —— 于是**双方都在发**的会话
+    //   （对讲、双向视频）永远算不出 RTT：对方发的是 SR 而不是 RR。
+    handle_report_blocks(sr.reports, arrival_us);
 }
 
 void SourceTracker::on_receiver_report(const ReceiverReport& rr,
                                        std::int64_t now_us)
 {
-    for (const ReportBlock& rb : rr.reports) {
+    handle_report_blocks(rr.reports, now_us);
+}
+
+void SourceTracker::handle_report_blocks(const std::vector<ReportBlock>& blocks,
+                                         std::int64_t now_us)
+{
+    for (const ReportBlock& rb : blocks) {
         // 只关心"报告我的 SSRC"的块
         if (local_ssrc_ == 0 || rb.ssrc != local_ssrc_) {
             continue;
         }
-        if (!has_local_sr_ || rb.lsr != local_last_sr_ntp_msw_) {
+        if (!has_local_sr_ || rb.lsr != local_last_sr_lsr_) {
             continue;   // lsr 未匹配我们的最近一次 SR，无法计算 RTT
         }
 
@@ -272,10 +283,10 @@ void SourceTracker::on_bye(const ByeReport& bye)
     }
 }
 
-void SourceTracker::on_local_sr_sent(std::uint32_t ntp_msw,
+void SourceTracker::on_local_sr_sent(std::uint32_t sr_lsr,
                                      std::int64_t sent_us)
 {
-    local_last_sr_ntp_msw_ = ntp_msw;
+    local_last_sr_lsr_ = sr_lsr;
     local_last_sr_sent_us_ = sent_us;
     has_local_sr_          = true;
 }
@@ -325,7 +336,7 @@ std::size_t SourceTracker::sender_count() const noexcept
 void SourceTracker::clear() noexcept
 {
     sources_.clear();
-    local_last_sr_ntp_msw_ = 0;
+    local_last_sr_lsr_ = 0;
     local_last_sr_sent_us_ = 0;
     has_local_sr_          = false;
     local_rtt_us_          = 0;

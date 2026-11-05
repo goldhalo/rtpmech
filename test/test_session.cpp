@@ -136,6 +136,33 @@ NETMECH_TEST(session_rejects_zero_clock_rate)
 }
 
 // ---------------------------------------------------------------------------
+// 2b. CNAME 超过 255 字节：构造期就拒绝
+//
+//     SDES item 的长度字段是单字节。放过去的话，send_rtcp 每次都会在
+//     build_rtcp_sdes 里失败并 return false —— RTCP 静默停发，应用侧只看到
+//     "对端收不到报告"，日志里什么都没有。
+// ---------------------------------------------------------------------------
+NETMECH_TEST(session_rejects_overlong_cname)
+{
+    std::error_code ec;
+
+    auto ok_cfg   = base_cfg();
+    ok_cfg.cname  = std::string(255, 'c');
+    auto ok_sess  = RtpSession::create(ok_cfg, std::make_shared<NullHandler>(), ec);
+    CHECK_MSG(!ec, "255 字节 CNAME 应当允许");
+    CHECK(ok_sess != nullptr);
+    if (ok_sess) {
+        ok_sess->close();
+    }
+
+    auto bad_cfg  = base_cfg();
+    bad_cfg.cname = std::string(256, 'c');
+    auto bad_sess = RtpSession::create(bad_cfg, std::make_shared<NullHandler>(), ec);
+    CHECK(bad_sess == nullptr);
+    CHECK(ec == RtpErrc::invalid_argument);
+}
+
+// ---------------------------------------------------------------------------
 // 3. 收发往返：字段与载荷都正确
 // ---------------------------------------------------------------------------
 NETMECH_TEST(session_send_receive_roundtrip)
@@ -545,6 +572,119 @@ NETMECH_TEST(session_port_range_allocates_distinct_pairs)
     CHECK(b->local_rtp_port() >= *base);
     CHECK(a->local_rtp_port() <= static_cast<std::uint16_t>(*base + 3));
     CHECK(b->local_rtp_port() <= static_cast<std::uint16_t>(*base + 3));
+
+    a->close();
+    b->close();
+}
+
+// ---------------------------------------------------------------------------
+// 10. RTT 闭环：一方发数据（SR）、另一方只收（RR），发送方必须测出 RTT
+//
+//     这条钉的是"tracker 有没有真正接进会话"。修之前：
+//       · on_rtcp_datagram 从来没调过 tracker 的 SR/RR/BYE；
+//       · on_local_sr_sent 有实现、无调用点；
+//       · tracker 的 local_ssrc 拿的是 0（随机 SSRC 时），on_receiver_report
+//         第一条判据就把所有 RR 跳过；
+//       · on_local_sr_sent 存的是"NTP 高 32 位"，而对端回填的 LSR 是"中间
+//         32 位"，两边不同构。
+//     四者任一没修，rtt_us 都永远是 nullopt —— 而旧测试只看计数，全绿。
+// ---------------------------------------------------------------------------
+NETMECH_TEST(session_rtt_measured_when_only_one_side_sends)
+{
+    // 要 4 个连续端口：(p, p+1) 给 A，(p+2, p+3) 给 B
+    const auto base = netmech::find_free_port_run(40000, 50000, 4, 2);
+    REQUIRE(base.has_value());
+
+    std::error_code ec;
+
+    auto cfg_a       = base_cfg();
+    cfg_a.local      = Endpoint("127.0.0.1", *base);
+    cfg_a.remote     = Endpoint("127.0.0.1", static_cast<std::uint16_t>(*base + 2));
+    cfg_a.enable_rtcp = true;
+    auto a = RtpSession::create(cfg_a, std::make_shared<NullHandler>(), ec);
+    REQUIRE(!ec);
+
+    auto cfg_b       = base_cfg();
+    cfg_b.local      = Endpoint("127.0.0.1", static_cast<std::uint16_t>(*base + 2));
+    cfg_b.remote     = Endpoint("127.0.0.1", *base);
+    cfg_b.enable_rtcp = true;
+    auto b = RtpSession::create(cfg_b, std::make_shared<NullHandler>(), ec);
+    REQUIRE(!ec);
+
+    // A 发几个 RTP ⇒ 此后 A 是"发送者"（发 SR 而不是 RR）
+    const std::uint8_t payload[4] = {0x11, 0x22, 0x33, 0x44};
+    for (int i = 0; i < 3; ++i) {
+        a->send(ConstBuf{nullptr, payload, sizeof payload}, i == 2);
+        std::this_thread::sleep_for(20ms);
+    }
+
+    // A 发 SR → B 收到后回 RR（带 lsr）→ A 算出 RTT
+    a->send_rtcp_now();
+    std::this_thread::sleep_for(100ms);
+    b->send_rtcp_now();
+    std::this_thread::sleep_for(100ms);
+
+    const auto sa = a->stats();
+    CHECK_MSG(sa.rtt_us.has_value(),
+              "A 侧 RTT 未测出：tracker 未接通 / local_ssrc=0 / LSR 不同构");
+    if (sa.rtt_us.has_value()) {
+        // 回环上 RTT 是亚毫秒级；给一个宽松上限，只用来发现"算出了个天文数字"
+        CHECK_MSG(*sa.rtt_us < 2000000u,
+                  ("RTT 异常大: " + std::to_string(*sa.rtt_us)).c_str());
+    }
+
+    a->close();
+    b->close();
+}
+
+// ---------------------------------------------------------------------------
+// 11. 双向都在发：SR 里的报告块同样要能算 RTT
+//
+//     RFC 3550 §6.4.1 规定 SR = 发送者信息 + 0..31 个报告块，与 RR 的报告块
+//     等价。只处理 RR 的话，"双方都在发"的会话（对讲、双向视频）永远算不出
+//     RTT —— 因为对端发的是 SR。
+// ---------------------------------------------------------------------------
+NETMECH_TEST(session_rtt_measured_between_two_senders)
+{
+    const auto base = netmech::find_free_port_run(40000, 50000, 4, 2);
+    REQUIRE(base.has_value());
+
+    std::error_code ec;
+
+    auto cfg_a        = base_cfg();
+    cfg_a.local       = Endpoint("127.0.0.1", *base);
+    cfg_a.remote      = Endpoint("127.0.0.1", static_cast<std::uint16_t>(*base + 2));
+    cfg_a.enable_rtcp = true;
+    auto a = RtpSession::create(cfg_a, std::make_shared<NullHandler>(), ec);
+    REQUIRE(!ec);
+
+    auto cfg_b        = base_cfg();
+    cfg_b.local       = Endpoint("127.0.0.1", static_cast<std::uint16_t>(*base + 2));
+    cfg_b.remote      = Endpoint("127.0.0.1", *base);
+    cfg_b.enable_rtcp = true;
+    auto b = RtpSession::create(cfg_b, std::make_shared<NullHandler>(), ec);
+    REQUIRE(!ec);
+
+    const std::uint8_t payload[4] = {0x55, 0x66, 0x77, 0x88};
+    for (int i = 0; i < 3; ++i) {
+        a->send(ConstBuf{nullptr, payload, sizeof payload}, i == 2);
+        b->send(ConstBuf{nullptr, payload, sizeof payload}, i == 2);
+        std::this_thread::sleep_for(20ms);
+    }
+
+    // 交替催：A 发 SR → B 发 SR（报告块里 lsr = A 的 SR）→ A 算出 RTT；再反过来
+    for (int round = 0; round < 3; ++round) {
+        a->send_rtcp_now();
+        std::this_thread::sleep_for(60ms);
+        b->send_rtcp_now();
+        std::this_thread::sleep_for(60ms);
+    }
+
+    const auto sa = a->stats();
+    const auto sb = b->stats();
+
+    CHECK_MSG(sa.rtt_us.has_value(), "A 侧 RTT 未测出（SR 报告块没参与计算）");
+    CHECK_MSG(sb.rtt_us.has_value(), "B 侧 RTT 未测出（SR 报告块没参与计算）");
 
     a->close();
     b->close();

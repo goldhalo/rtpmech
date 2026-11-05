@@ -204,6 +204,50 @@ jobs:
           fi
 
   # ---------------------------------------------------------------------------
+  # TSan（数据竞争）
+  #
+  # ASan/UBSan 抓不到数据竞争：两个线程同时碰一块内存，读到的值"碰巧对"时
+  # 一点症状都没有。本库的会话层约定是"可变状态只在端点的 io 线程上碰、
+  # 公开 API 先 post 过去"，这条规矩一旦哪处漏了，只有 TSan 看得见。
+  #
+  # 2026-11 首次开这个 job 时是 0 条（send_bye 刚改成投递、stats 刚改成
+  # 读原子镜像），所以**不留 suppression**：再报就是真问题。
+  # ---------------------------------------------------------------------------
+  tsan:
+    name: TSan
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+
+    steps:
+      - name: 检出（含 netmech submodule）
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: 安装工具
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y cmake ninja-build g++
+
+      - name: 配置（Debug + TSan）
+        run: |
+          cmake -S . -B build-tsan -G Ninja \
+                -DCMAKE_BUILD_TYPE=Debug \
+                -DCMAKE_C_FLAGS="-fsanitize=thread -fno-omit-frame-pointer -g -O1" \
+                -DCMAKE_CXX_FLAGS="-fsanitize=thread -fno-omit-frame-pointer -g -O1" \
+                -DCMAKE_EXE_LINKER_FLAGS="-fsanitize=thread" \
+                -DRTPMECH_BUILD_TESTS=ON \
+                -DRTPMECH_BUILD_EXAMPLES=OFF
+
+      - name: 构建
+        run: cmake --build build-tsan --parallel
+
+      - name: 测试（报告任何数据竞争即失败）
+        env:
+          TSAN_OPTIONS: halt_on_error=1:second_deadlock_stack=1
+        run: ctest --test-dir build-tsan --output-on-failure --timeout 300
+
+  # ---------------------------------------------------------------------------
   # 质量门禁
   # ---------------------------------------------------------------------------
   quality:

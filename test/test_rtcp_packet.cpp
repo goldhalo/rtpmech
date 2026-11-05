@@ -469,3 +469,83 @@ NETMECH_TEST(sdes_chunk_without_padding_parses)
     CHECK_EQ(parsed->chunks[0].ssrc, 0x2121A1F6u);
     CHECK(parsed->chunks[0].cname == "rtpmech-555852278");
 }
+
+// ---------------------------------------------------------------------------
+// SDES / BYE 的单项长度上限：len 字段是**单字节**，> 255 必须报错而不是被取模
+//
+// 以前 `static_cast<std::uint8_t>(size)` 对 256 字节的 CNAME 会写成 len=0
+// （对端语义是 END），后面的字节被当成填充 —— 生成一个结构错乱、但
+// buffer_too_small 又检查不出来的复合包。
+// ---------------------------------------------------------------------------
+NETMECH_TEST(rtcp_sdes_rejects_item_over_255)
+{
+    for (std::size_t n : {std::size_t{255}, std::size_t{256}, std::size_t{1000}}) {
+        SdesReport sdes;
+        SdesChunk  chunk;
+        chunk.ssrc  = 0x11223344u;
+        chunk.cname = std::string(n, 'a');
+        sdes.chunks.push_back(chunk);
+
+        std::vector<std::uint8_t> buf(2048, 0);
+        std::error_code           ec;
+        const std::size_t w = build_rtcp_sdes(buf.data(), buf.size(), sdes, ec);
+
+        if (n <= 255) {
+            CHECK_MSG(!ec, ("255 字节以内应当成功, n=" + std::to_string(n)).c_str());
+            CHECK(w > 0);
+        } else {
+            CHECK_MSG(ec == RtpErrc::invalid_argument,
+                      ("超过 255 应当 invalid_argument, n=" + std::to_string(n)).c_str());
+            CHECK_EQ(w, std::size_t{0});
+        }
+    }
+}
+
+NETMECH_TEST(rtcp_bye_rejects_reason_over_255)
+{
+    for (std::size_t n : {std::size_t{255}, std::size_t{256}}) {
+        ByeReport bye;
+        bye.ssrcs.push_back(0x55667788u);
+        bye.reason = std::string(n, 'b');
+
+        std::vector<std::uint8_t> buf(2048, 0);
+        std::error_code           ec;
+        const std::size_t w = build_rtcp_bye(buf.data(), buf.size(), bye, ec);
+
+        if (n <= 255) {
+            CHECK_MSG(!ec, "255 字节应当成功");
+            CHECK(w > 0);
+        } else {
+            CHECK_MSG(ec == RtpErrc::invalid_argument, "超过 255 应当 invalid_argument");
+            CHECK_EQ(w, std::size_t{0});
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// make_ntp_time 的纳秒归一：nano >= 1e9 要进位到秒，不能截断
+//
+// 以前 (nano << 32) / 1e9 在 nano = 1.5e9 时结果是 1.5 × 2^32，
+// 强转 uint32_t 后变成 0.5s —— 时间戳往回跳了一整秒。
+// ---------------------------------------------------------------------------
+NETMECH_TEST(rtcp_ntp_normalizes_out_of_range_nanoseconds)
+{
+    std::int64_t  sec  = 0;
+    std::uint32_t nano = 0;
+
+    // 1.5 秒 == (sec=1, nano=0.5e9)，必须与"归一后"完全一致
+    const NtpTime a = make_ntp_time(100, 1500000000u);
+    split_ntp_time(a, sec, nano);
+    CHECK_EQ(sec, std::int64_t{101});
+    CHECK_EQ(nano, 500000000u);
+
+    const NtpTime b = make_ntp_time(101, 500000000u);
+    CHECK_EQ(a.seconds, b.seconds);
+    CHECK_EQ(a.fraction, b.fraction);
+
+    // 恰好 1e9：进位到下一秒、小数部分为 0
+    const NtpTime c = make_ntp_time(7, 1000000000u);
+    split_ntp_time(c, sec, nano);
+    CHECK_EQ(sec, std::int64_t{8});
+    CHECK_EQ(nano, 0u);
+}
