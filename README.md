@@ -30,7 +30,6 @@
 
 ```cpp
 #include <rtpmech/rtpmech.hpp>
-#include <netmech/net.hpp>
 
 using namespace rtpmech;
 
@@ -48,8 +47,6 @@ public:
 
 int main() {
     // 不需要 netmech：io 线程数默认取 CPU 核数
-
-
     RtpSessionConfig cfg;
     cfg.local      = rtpmech::Endpoint("0.0.0.0", 5000);   // RTCP 自动用 5001
     cfg.clock_rate = 90000;
@@ -64,7 +61,6 @@ int main() {
 
     std::getchar();
     sess->close();          // 会发 RTCP BYE
-    netmech::shutdown();
 }
 ```
 
@@ -183,7 +179,9 @@ class PsPacketizer : public rtpmech::Packetizer {
 
 - C++17 编译器（MSVC 2019+ / GCC 9+）
 - CMake ≥ 3.16
-- **netmech**（底层网络库）
+- **netmech**（底层网络库，**链接期依赖**）
+
+> 头文件层面不依赖它（见下方"安装"），但**链接**时需要 `libnetmech.a`。
 
 netmech 默认从 `thirdparty/netmech` 取（git submodule）。开发时也可以直接指向本地目录：
 
@@ -236,7 +234,7 @@ export QEMU_LD_PREFIX=/opt/gcc-arm-10.2-2020.11-x86_64-aarch64-none-linux-gnu/aa
 
 | 选项 | 默认 | 说明 |
 |---|---|---|
-| `RTPMECH_BUILD_TESTS` | ON | 单元测试（69 用例 / 344 断言） |
+| `RTPMECH_BUILD_TESTS` | ON | 单元测试（83 用例 / 419 断言） |
 | `RTPMECH_BUILD_EXAMPLES` | ON | `rtp_loopback` / `rtp_recv` / `rtp_send` |
 | `RTPMECH_WARNINGS_AS_ERRORS` | OFF | CI 用 |
 
@@ -245,16 +243,20 @@ export QEMU_LD_PREFIX=/opt/gcc-arm-10.2-2020.11-x86_64-aarch64-none-linux-gnu/aa
 ## 目录结构
 
 ```
-include/rtpmech/    公共头（6 个）
+include/rtpmech/    公共头（11 个）
   span.hpp          轻量 span（C++17 没有 std::span）
+  endpoint.hpp      端点（IP + 端口，不引 netmech）
+  buffer.hpp        ConstBuf / Buf（发送载荷 + 可选持有者）
   error.hpp         RtpErrc 错误码
   rtp_packet.hpp    RtpPacket（只读视图）+ RtpPacketInfo + 构造
   rtcp_packet.hpp   RtcpCompoundPacket + SR/RR/SDES/BYE/APP
+  h264.hpp/h265.hpp 按 RFC 6184 / 7798 的分片打包
+  packetizer.hpp    打包器抽象
   session.hpp       RtpSession / RtpHandler / Config / SendResult / Stats
   rtpmech.hpp       汇总头，业务代码只需要它
 
 src/                实现（含内部头 source_tracker / rtcp_scheduler）
-test/               69 用例 / 344 断言
+test/               83 用例 / 419 断言
 example/            loopback / recv / send
 docs/design/        概要设计与接口草案
 ```
@@ -265,8 +267,8 @@ docs/design/        概要设计与接口草案
 
 | 平台 | 编译器 | 状态 |
 |---|---|---|
-| Windows 10/11 x64 | MSVC 14.44 | ✅ 69 用例全绿 |
-| Linux x86_64 | GCC 15（WSL2 Ubuntu） | ✅ 69 用例全绿 |
+| Windows 10/11 x64 | MSVC 14.44 | ✅ 83 用例全绿 |
+| Linux x86_64 | GCC 15（WSL2 Ubuntu） | ✅ 83 用例全绿 |
 | Linux aarch64 | Arm GNU 10.2（交叉） | ✅ 交叉编译通过（运行时待板子验证） |
 
 ---
