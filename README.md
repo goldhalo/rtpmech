@@ -234,7 +234,7 @@ export QEMU_LD_PREFIX=/opt/gcc-arm-10.2-2020.11-x86_64-aarch64-none-linux-gnu/aa
 
 | 选项 | 默认 | 说明 |
 |---|---|---|
-| `RTPMECH_BUILD_TESTS` | ON | 单元测试（83 用例 / 419 断言） |
+| `RTPMECH_BUILD_TESTS` | ON | 单元测试 |
 | `RTPMECH_BUILD_EXAMPLES` | ON | `rtp_loopback` / `rtp_recv` / `rtp_send` |
 | `RTPMECH_WARNINGS_AS_ERRORS` | OFF | CI 用 |
 
@@ -243,7 +243,7 @@ export QEMU_LD_PREFIX=/opt/gcc-arm-10.2-2020.11-x86_64-aarch64-none-linux-gnu/aa
 ## 目录结构
 
 ```
-include/rtpmech/    公共头（11 个）
+include/rtpmech/    公共头
   span.hpp          轻量 span（C++17 没有 std::span）
   endpoint.hpp      端点（IP + 端口，不引 netmech）
   buffer.hpp        ConstBuf / Buf（发送载荷 + 可选持有者）
@@ -256,7 +256,7 @@ include/rtpmech/    公共头（11 个）
   rtpmech.hpp       汇总头，业务代码只需要它
 
 src/                实现（含内部头 source_tracker / rtcp_scheduler）
-test/               83 用例 / 419 断言
+test/               单元测试
 example/            loopback / recv / send
 docs/design/        概要设计与接口草案
 ```
@@ -267,8 +267,8 @@ docs/design/        概要设计与接口草案
 
 | 平台 | 编译器 | 状态 |
 |---|---|---|
-| Windows 10/11 x64 | MSVC 14.44 | ✅ 83 用例全绿 |
-| Linux x86_64 | GCC 15（WSL2 Ubuntu） | ✅ 83 用例全绿 |
+| Windows 10/11 x64 | MSVC 14.44 | ✅ 全量通过 |
+| Linux x86_64 | GCC 15（WSL2 Ubuntu） | ✅ 全量通过 |
 | Linux aarch64 | Arm GNU 10.2（交叉） | ✅ 交叉编译通过（运行时待板子验证） |
 
 ---
