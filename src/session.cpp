@@ -33,6 +33,7 @@
 #include <vector>
 #include <optional>
 #include <memory>
+#include <map>
 #include <mutex>
 #include <cstddef>
 #include <cstdint>
@@ -572,9 +573,53 @@ private:
     // -------------------------------------------------------------------------
 
     /// 建立 RTP 端点。端口 0 时交给系统分配，但要保证偶数 —— 奇数就丢弃重来。
+    /// 进程级端口分配器（按区间共享，游标跨会话保持）。
+    ///
+    /// 以前的做法是"每个会话都从 `local.port()` 重新扫一遍"：区间里已有 N 路
+    /// 在用，第 N+1 路就要空转 N 次探测；而且刚释放的端口会被下一路立刻抢回
+    /// （对端可能还留着旧流的状态）。改用带游标的分配器：从上次的位置继续，
+    /// 走到区间尾回绕。
+    static std::shared_ptr<netmech::PortAllocator> allocator_for(std::uint16_t lo,
+                                                                std::uint16_t hi)
+    {
+        static std::mutex mu;
+        static std::map<std::pair<std::uint16_t, std::uint16_t>,
+                        std::shared_ptr<netmech::PortAllocator>> registry;
+
+        const std::pair<std::uint16_t, std::uint16_t> key{lo, hi};
+        std::lock_guard<std::mutex> lk(mu);
+        auto it = registry.find(key);
+        if (it != registry.end()) {
+            return it->second;
+        }
+        auto alloc = std::make_shared<netmech::PortAllocator>(lo, hi);
+        registry.emplace(key, alloc);
+        return alloc;
+    }
+
     bool open_rtp_endpoint(std::error_code& ec)
     {
         const std::uint16_t want = cfg_.local.port();
+
+        if (want != 0 && cfg_.rtp_port_end > want) {
+            // 给了区间：用分配器挑一对（游标续着走，不每次从头扫）
+            auto alloc = allocator_for(static_cast<std::uint16_t>(round_up_even(want)),
+                                       cfg_.rtp_port_end);
+            // 探测与真正 bind 之间有极小窗口，撞上了就再要一对（最多 8 次）
+            for (int attempt = 0; attempt < 8; ++attempt) {
+                const auto first = alloc->acquire(/*count=*/2, /*alignment=*/2);
+                if (!first.has_value()) {
+                    break;
+                }
+                if (try_bind_rtp(*first, ec)) {
+                    goto bound;
+                }
+            }
+            if (!ec) {
+                ec = make_error_code(RtpErrc::invalid_argument);   // 区间里没有可用配对了
+            }
+            return false;
+        }
 
         if (want != 0) {
             // 显式端口：向上取偶，绑不上就是失败（协商场景不重试）
@@ -603,6 +648,7 @@ private:
             }
         }
 
+    bound:
         // ★ 必须等端口**定下来**再设 post_：这段以前放进了 try_bind_rtp，
         //   而那是"端口搜索循环"里的函数 —— 每次尝试都会重设，且上一轮
         //   丢弃的端点会触发 on_close，把刚建好的会话误判成"端点死了"。

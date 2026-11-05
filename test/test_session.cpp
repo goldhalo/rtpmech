@@ -514,3 +514,38 @@ NETMECH_TEST(session_destroy_while_active)
     }
     CHECK(wait_for([&] { return handler->closed.load() == 1; }, 1000ms));
 }
+
+// ---------------------------------------------------------------------------
+// 端口区间：同一个区间里连续建会话，应当拿到**不同的**端口对
+// （分配器带游标，不会每次都从区间起点重扫）
+// ---------------------------------------------------------------------------
+NETMECH_TEST(session_port_range_allocates_distinct_pairs)
+{
+    const auto base = netmech::find_free_port_run(41000, 42000, 4, 2);
+    REQUIRE(base.has_value());
+
+    auto cfg = base_cfg();
+    cfg.local        = Endpoint("127.0.0.1", *base);
+    cfg.rtp_port_end = static_cast<std::uint16_t>(*base + 3);
+
+    std::error_code ec;
+    auto a = RtpSession::create(cfg, std::make_shared<NullHandler>(), ec);
+    REQUIRE(!ec);
+    REQUIRE(a != nullptr);
+
+    auto b = RtpSession::create(cfg, std::make_shared<NullHandler>(), ec);
+    REQUIRE(!ec);
+    REQUIRE(b != nullptr);
+
+    CHECK(a->local_rtp_port() != b->local_rtp_port());
+    CHECK_EQ((a->local_rtp_port() % 2u), 0u);
+    CHECK_EQ((b->local_rtp_port() % 2u), 0u);
+    // 两对都要落在区间内
+    CHECK(a->local_rtp_port() >= *base);
+    CHECK(b->local_rtp_port() >= *base);
+    CHECK(a->local_rtp_port() <= static_cast<std::uint16_t>(*base + 3));
+    CHECK(b->local_rtp_port() <= static_cast<std::uint16_t>(*base + 3));
+
+    a->close();
+    b->close();
+}
