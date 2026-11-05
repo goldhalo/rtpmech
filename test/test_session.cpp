@@ -222,7 +222,14 @@ NETMECH_TEST(session_close_is_idempotent)
     sess->close();       // 幂等
     sess->close();
 
-    CHECK(!sess->is_open());
+    CHECK(!sess->is_open());                 // 这个是同步的：close() 立刻翻标志
+
+    // on_close 是**投递到 io 线程**才回调的（close() 只标记 + 排队），
+    // 所以这里要等一下 —— 但"恰好一次"仍然要成立（后两次 close 被幂等挡掉）。
+    for (int i = 0; i < 200 && handler->closed.load() == 0; ++i) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(5));
+    }
+    std::this_thread::sleep_for(std::chrono::milliseconds(20));   // 给"多回调"留出观察窗口
     CHECK_EQ(handler->closed.load(), 1);     // on_close 恰好一次
 
     // 业务侧常在关闭后打日志 / 上报统计，这些调用不能崩、不能返回垃圾

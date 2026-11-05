@@ -99,7 +99,14 @@ public:
     {
     }
 
-    ~Impl() { close(); }
+    ~Impl()
+    {
+        // 引用计数已归零：没有别的线程还会碰它，直接在析构线程收尾。
+        if (!closed_.exchange(true, std::memory_order_acq_rel)) {
+            open_.store(false, std::memory_order_release);
+            do_close();
+        }
+    }
 
     void set_facade(RtpSession* f) noexcept { facade_ = f; }
 
@@ -125,7 +132,12 @@ public:
         void on_close(netmech::UdpEndpoint&, std::error_code) override
         {
             if (auto self = owner_.lock()) {
-                self->close();
+                // ★ 只有会话**已经 open** 时，端点关闭才代表"连接没了"。
+                //   端口搜索阶段会主动丢弃奇数端口的端点，那时的 on_close
+                //   属于内部动作，不能把会话判死。
+                if (self->is_open()) {
+                    Impl::request_close(self);
+                }
             }
         }
 
@@ -226,10 +238,7 @@ public:
         }
 
         rtp_received_.fetch_add(1, std::memory_order_relaxed);
-        {
-            std::lock_guard<std::mutex> lk(rtcp_mu_);
-            tracker_.on_rtp_received(*pkt, steady_now_us());
-        }
+        tracker_.on_rtp_received(*pkt, steady_now_us());
 
         // 回调里 pkt 是借用视图，返回即失效
         if (handler_ && facade_ != nullptr) {
@@ -259,6 +268,62 @@ public:
     // -------------------------------------------------------------------------
     //  发送
     // -------------------------------------------------------------------------
+
+    /// 对外入口：同步校验 + 投递到 io 线程。
+    SendResult post_send(rtpmech::ConstBuf payload, bool marker,
+                         std::optional<std::uint32_t> ts_override,
+                         std::optional<Endpoint>       dst_override)
+    {
+        if (!open_.load(std::memory_order_acquire)) {
+            return SendResult::closed;
+        }
+        if (payload.data == nullptr || payload.size == 0) {
+            return SendResult::invalid;
+        }
+        // MTU：头按最坏情况估（固定头 12 字节，本实现不加 CSRC/扩展）。
+        // 这条必须在**投递之前**判 —— 否则调用方拿到的是 accepted，
+        // 而实际上包已经被丢掉了。
+        if (12 + payload.size > cfg_.max_packet_size) {
+            return SendResult::invalid;
+        }
+        if (dst_override) {
+            if (dst_override->port() == 0) {
+                return SendResult::invalid;
+            }
+        } else if (!cfg_.remote.has_value() || cfg_.remote->port() == 0) {
+            return SendResult::invalid;
+        }
+
+        auto self = weak_from_this().lock();
+        if (!self) {
+            return SendResult::closed;
+        }
+        auto fn = [self, payload, marker, ts_override, dst_override]() mutable {
+            (void)self->send_payload(payload, marker, ts_override, dst_override);
+        };
+        if (post_) {
+            post_(std::move(fn), /*allow_inline=*/true);
+        } else {
+            fn();
+        }
+        return SendResult::accepted;
+    }
+
+    /// 对外入口：提交"立刻发一次 RTCP"。
+    bool post_rtcp_now()
+    {
+        auto self = weak_from_this().lock();
+        if (!self) {
+            return false;
+        }
+        auto fn = [self] { (void)self->send_rtcp(/*force=*/true); };
+        if (post_) {
+            post_(std::move(fn), /*allow_inline=*/true);
+        } else {
+            fn();
+        }
+        return true;
+    }
 
     SendResult send_payload(rtpmech::ConstBuf payload, bool marker,
                             const std::optional<std::uint32_t>& ts_override,
@@ -304,11 +369,10 @@ public:
             return SendResult::invalid;   // 既没配 remote 也没给 dst
         }
 
-        auto ep = rtp_endpoint();
-        if (!ep) {
+        if (!rtp_ep_) {
             return SendResult::closed;
         }
-        if (!ep->send_to(dst, netmech::ConstBuf{wire, wire->data(), written})) {
+        if (!rtp_ep_->send_to(dst, netmech::ConstBuf{wire, wire->data(), written})) {
             return SendResult::closed;
         }
 
@@ -326,9 +390,6 @@ public:
         if (!cfg_.enable_rtcp || !open_.load(std::memory_order_acquire)) {
             return false;
         }
-        // 锁内完成"查是否到期 + 组包 + 更新调度器"：这两步必须原子，
-        // 否则定时器和 send_rtcp_now() 会同时改 scheduler_ 的状态（TSan 抓过）。
-        std::lock_guard<std::mutex> lk(rtcp_mu_);
         if (!force && !scheduler_.due(steady_now_sec())) {
             return true;   // 未到期
         }
@@ -386,22 +447,17 @@ public:
 
     void schedule_rtcp()
     {
-        auto ep = rtcp_endpoint();
-        if (!cfg_.enable_rtcp || !ep || !open_.load(std::memory_order_acquire)) {
+        if (!cfg_.enable_rtcp || !rtcp_ep_ || !open_.load(std::memory_order_acquire)) {
             return;
         }
         const double now = steady_now_sec();
         // 距下次还剩多久（可能为负 = 已逾期，给个下限避免忙等）
-        double delay_sec = 0.001;
-        {
-            std::lock_guard<std::mutex> lk(rtcp_mu_);
-            delay_sec = std::max(0.001, scheduler_.time_until_next(now));
-        }
+        const double delay_sec = std::max(0.001, scheduler_.time_until_next(now));
         const auto interval =
             std::chrono::milliseconds(static_cast<std::int64_t>(delay_sec * 1000.0));
 
         auto weak = weak_from_this();
-        ep->set_timer(interval, weak, [weak] {
+        rtcp_ep_->set_timer(interval, weak, [weak] {
             if (auto s = weak.lock()) {
                 (void)s->send_rtcp(/*force=*/false);
                 s->schedule_rtcp();      // 下一拍（间隔随成员数变化）
@@ -411,7 +467,7 @@ public:
 
     void send_bye(const std::string& reason)
     {
-        if (!cfg_.enable_rtcp || !rtcp_endpoint()) {
+        if (!cfg_.enable_rtcp || !rtcp_ep_) {
             return;
         }
         std::vector<std::uint8_t> buf(cfg_.max_packet_size, 0);
@@ -434,31 +490,48 @@ public:
     //  关闭
     // -------------------------------------------------------------------------
 
-    void close() noexcept
+    /// 对外入口：幂等、可任意线程调。
+    ///
+    /// `open_` 在这里**同步**置 false（is_open()/send() 立刻反映已关），
+    /// 收尾工作一律用 `asio::post` 投递到 io 线程 ——
+    /// **不能用 dispatch**：从 io 线程内部调用时 dispatch 会就地执行、插到
+    /// 已排队的 send 前面，把还没发出去的包连带端点一起丢掉。
+    static void request_close(std::shared_ptr<Impl> self) noexcept
     {
-        if (closed_.exchange(true, std::memory_order_acq_rel)) {
+        if (!self) {
             return;
         }
-        const bool was_open = open_.exchange(false, std::memory_order_acq_rel);
-
-        if (was_open) {
-            send_bye({});            // 尽力发，不关心结果
+        if (self->closed_.exchange(true, std::memory_order_acq_rel)) {
+            return;
         }
-        // 先把两个端点摘下来（锁内），再在锁外关 —— 关闭动作本身会回调，
-        // 不能拿着 ep_mu_ 去调。
-        std::shared_ptr<netmech::UdpEndpoint> rtp_ep;
-        std::shared_ptr<netmech::UdpEndpoint> rtcp_ep;
-        take_endpoints(rtp_ep, rtcp_ep);
+        self->open_.store(false, std::memory_order_release);
 
-        if (rtcp_ep) {
-            rtcp_ep->clear_timer();
-            rtcp_ep->close();
+        auto fn = [self] { self->do_close(); };
+        if (self->post_) {
+            // ★ 一律排队（不内联）：close 必须排在已投递的发送之后，
+            //   否则从 io 线程内部调用时会把还没发出去的包连端点一起丢掉。
+            self->post_(std::move(fn), /*allow_inline=*/false);
+        } else {
+            fn();
         }
-        if (rtp_ep) {
-            rtp_ep->close();
+    }
+
+    /// 收尾（**只在 io 线程上执行**）。
+    void do_close() noexcept
+    {
+        send_bye({});            // 尽力发，不关心结果
+
+        if (rtcp_ep_) {
+            rtcp_ep_->clear_timer();
+            rtcp_ep_->close();
+            rtcp_ep_.reset();
+        }
+        if (rtp_ep_) {
+            rtp_ep_->close();
+            rtp_ep_.reset();
         }
 
-        if (was_open && handler_) {
+        if (handler_) {
             handler_->on_close(std::error_code{});
         }
     }
@@ -486,11 +559,8 @@ public:
         st.rtcp_received  = rtcp_received_.load(std::memory_order_relaxed);
         st.send_rejected  = send_rejected_.load(std::memory_order_relaxed);
         st.parse_errors   = parse_errors_.load(std::memory_order_relaxed);
-        {
-            std::lock_guard<std::mutex> lk(rtcp_mu_);
-            st.active_sources = tracker_.size();
-            st.rtt_us         = tracker_.rtt_us();
-        }
+        st.active_sources = tracker_.size();
+        st.rtt_us         = tracker_.rtt_us();
         return st;
     }
 
@@ -508,24 +578,41 @@ private:
 
         if (want != 0) {
             // 显式端口：向上取偶，绑不上就是失败（协商场景不重试）
-            return try_bind_rtp(round_up_even(want), ec);
-        }
-
-        // 端口 0：系统分配 + 偶数校验
-        for (int i = 0; i < kMaxAutoPortAttempts; ++i) {
-            if (!try_bind_rtp(0, ec)) {
+            if (!try_bind_rtp(round_up_even(want), ec)) {
                 return false;
             }
-            if ((rtp_port_ & 1u) == 0) {
-                return true;      // 偶数，可用
+        } else {
+            // 端口 0：系统分配 + 偶数校验
+            bool bound = false;
+            for (int i = 0; i < kMaxAutoPortAttempts; ++i) {
+                if (!try_bind_rtp(0, ec)) {
+                    return false;
+                }
+                if ((rtp_port_ & 1u) == 0) {
+                    bound = true;
+                    break;        // 偶数，可用
+                }
+                // 系统给了奇数：丢弃重来
+                rtp_ep_->close();
+                rtp_ep_.reset();
+                rtp_port_ = 0;
             }
-            // 系统给了奇数：丢弃重来
-            rtp_ep_->close();
-            rtp_ep_.reset();
-            rtp_port_ = 0;
+            if (!bound) {
+                ec = make_error_code(RtpErrc::invalid_argument);
+                return false;
+            }
         }
-        ec = make_error_code(RtpErrc::invalid_argument);
-        return false;
+
+        // ★ 必须等端口**定下来**再设 post_：这段以前放进了 try_bind_rtp，
+        //   而那是"端口搜索循环"里的函数 —— 每次尝试都会重设，且上一轮
+        //   丢弃的端点会触发 on_close，把刚建好的会话误判成"端点死了"。
+        //
+        //   之后所有公开 API 都通过它投递到本端点的 io 线程：
+        //   发送允许内联（已经在线程上就直接干），关闭一律排队（FIFO）。
+        post_ = [ep = rtp_ep_](std::function<void()> fn, bool allow_inline) {
+            ep->post(std::move(fn), allow_inline);
+        };
+        return true;
     }
 
     bool try_bind_rtp(std::uint16_t port, std::error_code& ec)
@@ -552,39 +639,13 @@ private:
     }
 
     // -------------------------------------------------------------------------
-    //  端点访问（线程安全）
-    // -------------------------------------------------------------------------
-
-    [[nodiscard]] std::shared_ptr<netmech::UdpEndpoint> rtp_endpoint() const noexcept
-    {
-        std::lock_guard<std::mutex> lk(ep_mu_);
-        return rtp_ep_;
-    }
-
-    [[nodiscard]] std::shared_ptr<netmech::UdpEndpoint> rtcp_endpoint() const noexcept
-    {
-        std::lock_guard<std::mutex> lk(ep_mu_);
-        return rtcp_ep_;
-    }
-
-    /// 取出两个端点并清空（关闭路径用）；返回的副本由调用方负责 close。
-    void take_endpoints(std::shared_ptr<netmech::UdpEndpoint>& rtp,
-                        std::shared_ptr<netmech::UdpEndpoint>& rtcp) noexcept
-    {
-        std::lock_guard<std::mutex> lk(ep_mu_);
-        rtp  = std::move(rtp_ep_);
-        rtcp = std::move(rtcp_ep_);
-    }
-
-    // -------------------------------------------------------------------------
     //  辅助
     // -------------------------------------------------------------------------
 
     /// 把 RTCP 报文发到对端的 RTCP 端口（remote.port() + 1）。
     bool send_on_rtcp(std::vector<std::uint8_t>& buf, std::size_t len)
     {
-        auto ep = rtcp_endpoint();
-        if (!ep || !cfg_.remote.has_value()) {
+        if (!rtcp_ep_ || !cfg_.remote.has_value()) {
             return false;
         }
         const netmech::Address dst(cfg_.remote->host(),
@@ -592,7 +653,7 @@ private:
 
         // 缓冲随 owner 交给库，保证活到真正发出
         auto holder = std::make_shared<std::vector<std::uint8_t>>(std::move(buf));
-        if (!ep->send_to(dst, netmech::ConstBuf{holder, holder->data(), len})) {
+        if (!rtcp_ep_->send_to(dst, netmech::ConstBuf{holder, holder->data(), len})) {
             return false;
         }
         rtcp_sent_.fetch_add(1, std::memory_order_relaxed);
@@ -659,9 +720,9 @@ private:
     //   · 端点定时器（io 线程）→ send_rtcp / schedule_rtcp；
     //   · 应用线程 → send_rtcp_now() / stats()；
     //   把这堆状态用一把锁护住。RTP 收包路径也要进来（更新 tracker）。
-    mutable std::mutex                    rtcp_mu_;
-
-    mutable std::mutex                    ep_mu_;
+    // ★ 可变状态（端点、tracker、调度器、序号）**只在端点的 io 线程上碰**。
+    //   公开 API 从别的线程进来先 post_ 过去，于是全程无锁。
+    std::function<void(std::function<void()>, bool)> post_;
     std::shared_ptr<netmech::UdpEndpoint> rtp_ep_;
     std::shared_ptr<netmech::UdpEndpoint> rtcp_ep_;
     std::shared_ptr<RtpHandler>           handler_;
@@ -703,7 +764,7 @@ RtpSession::RtpSession() = default;
 RtpSession::~RtpSession()
 {
     if (impl_) {
-        impl_->close();
+        Impl::request_close(impl_);
     }
 }
 
@@ -739,7 +800,7 @@ SendResult RtpSession::send(ConstBuf payload, bool marker)
     if (!impl_) {
         return SendResult::closed;
     }
-    return impl_->send_payload(payload, marker, std::nullopt, std::nullopt);
+    return impl_->post_send(payload, marker, std::nullopt, std::nullopt);
 }
 
 SendResult RtpSession::send_with_timestamp(ConstBuf payload, bool marker,
@@ -748,7 +809,7 @@ SendResult RtpSession::send_with_timestamp(ConstBuf payload, bool marker,
     if (!impl_) {
         return SendResult::closed;
     }
-    return impl_->send_payload(payload, marker, timestamp, std::nullopt);
+    return impl_->post_send(payload, marker, timestamp, std::nullopt);
 }
 
 SendResult RtpSession::send_to(const Endpoint& dst, ConstBuf payload, bool marker)
@@ -756,12 +817,15 @@ SendResult RtpSession::send_to(const Endpoint& dst, ConstBuf payload, bool marke
     if (!impl_) {
         return SendResult::closed;
     }
-    return impl_->send_payload(payload, marker, std::nullopt, dst);
+    return impl_->post_send(payload, marker, std::nullopt, dst);
 }
 
 bool RtpSession::send_rtcp_now()
 {
-    return impl_ && impl_->send_rtcp(/*force=*/true);
+    if (!impl_ || !impl_->is_open()) {
+        return false;
+    }
+    return impl_->post_rtcp_now();
 }
 
 void RtpSession::send_bye(const std::string& reason, bool close_after)
@@ -773,7 +837,7 @@ void RtpSession::send_bye(const std::string& reason, bool close_after)
         impl_->send_bye(reason);
     }
     if (close_after) {
-        impl_->close();
+        Impl::request_close(impl_);
     }
 }
 
@@ -811,7 +875,7 @@ const RtpSessionConfig& RtpSession::config() const noexcept
 void RtpSession::close() noexcept
 {
     if (impl_) {
-        impl_->close();
+        Impl::request_close(impl_);
     }
 }
 
