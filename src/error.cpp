@@ -6,6 +6,8 @@
 
 #include "rtpmech/error.hpp"
 
+#include <string>
+
 namespace rtpmech {
 
 namespace {

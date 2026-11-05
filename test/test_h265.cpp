@@ -8,6 +8,8 @@
 
 #include <cstring>
 #include <vector>
+#include <cstddef>
+#include <cstdint>
 
 #include "test_framework.hpp"
 

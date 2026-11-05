@@ -17,6 +17,9 @@
 #include <cstdio>
 #include <cstdlib>
 #include <thread>
+#include <memory>
+#include <cstdint>
+#include <system_error>
 
 using namespace rtpmech;
 using rtpmech::Endpoint;

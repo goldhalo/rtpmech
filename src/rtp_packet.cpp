@@ -18,6 +18,10 @@
 
 #include <cstring>
 #include <string>
+#include <optional>
+#include <cstddef>
+#include <cstdint>
+#include <system_error>
 
 namespace rtpmech {
 

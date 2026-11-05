@@ -19,6 +19,10 @@
 #include <mutex>
 #include <thread>
 #include <vector>
+#include <cstddef>
+#include <cstdint>
+#include <string>
+#include <system_error>
 
 #include "test_framework.hpp"
 

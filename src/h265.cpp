@@ -4,6 +4,9 @@
 #include <rtpmech/h265.hpp>
 
 #include <cstring>
+#include <vector>
+#include <cstddef>
+#include <cstdint>
 
 namespace rtpmech {
 

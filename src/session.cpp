@@ -31,6 +31,13 @@
 #include <chrono>
 #include <cstdio>
 #include <vector>
+#include <optional>
+#include <memory>
+#include <cstddef>
+#include <cstdint>
+#include <string>
+#include <system_error>
+#include <utility>
 
 namespace rtpmech {
 

@@ -16,6 +16,10 @@
 #include <cstdlib>
 #include <thread>
 #include <vector>
+#include <memory>
+#include <cstdint>
+#include <string>
+#include <system_error>
 
 using namespace rtpmech;
 using rtpmech::Endpoint;

@@ -14,6 +14,9 @@
 #include <cstring>
 #include <string>
 #include <vector>
+#include <cstddef>
+#include <cstdint>
+#include <system_error>
 
 #include "test_framework.hpp"
 

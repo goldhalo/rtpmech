@@ -18,6 +18,10 @@
 
 #include <algorithm>
 #include <chrono>
+#include <vector>
+#include <cstddef>
+#include <cstdint>
+#include <utility>
 
 namespace rtpmech {
 

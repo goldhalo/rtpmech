@@ -17,6 +17,13 @@
 #include "rtpmech/rtcp_packet.hpp"
 
 #include <cstring>
+#include <optional>
+#include <vector>
+#include <cstddef>
+#include <cstdint>
+#include <string>
+#include <system_error>
+#include <utility>
 
 namespace rtpmech {
 

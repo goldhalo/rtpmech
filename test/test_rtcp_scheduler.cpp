@@ -12,6 +12,8 @@
 
 #include "test_framework.hpp"
 
+#include <cstddef>
+
 using namespace rtpmech;
 
 // ---------------------------------------------------------------------------
