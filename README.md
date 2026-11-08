@@ -184,9 +184,11 @@ class PsPacketizer : public rtpmech::Packetizer {
 
 - C++17 编译器（MSVC 2019+ / GCC 9+）
 - CMake ≥ 3.16
-- **netmech**（底层网络库，**链接期依赖**）
+- **netmech**（底层网络库，**链接期依赖**，默认以静态库形式链入）
 
-> 头文件层面不依赖它（见下方"安装"），但**链接**时需要 `libnetmech.a`。
+> 头文件层面不依赖它（见下方"安装"）。静态构建时**链接**需要 `libnetmech.a`；
+> 构建成共享库（`-DRTPMECH_LIBRARY_TYPE=SHARED`）时 netmech 会被静态链入
+> `librtpmech.so`，对外发布**不需要**单独附 netmech 的二进制（MIT 许可证声明仍需保留）。
 
 netmech 默认从 `thirdparty/netmech` 取（git submodule）。开发时也可以直接指向本地目录：
 
@@ -263,7 +265,7 @@ include/rtpmech/    公共头
 src/                实现（含内部头 source_tracker / rtcp_scheduler）
 test/               单元测试
 example/            loopback / recv / send
-docs/design/        概要设计与接口草案
+docs/design/        概要设计（已实现的设计说明）
 ```
 
 ---
@@ -319,15 +321,18 @@ find_package(rtpmech REQUIRED)
 target_link_libraries(app PRIVATE rtpmech::rtpmech)
 ```
 
-`librtpmech.a + libnetmech.a + pthread` 不用手写，导入的 target 全带着。
+静态库场景 `librtpmech.a + libnetmech.a + pthread` 不用手写，导入的 target 全带着。
 
 **头层面不依赖 netmech**：`include/rtpmech/*.hpp` 里没有 `#include <netmech/...>`，
 地址用 `rtpmech::Endpoint`、载荷用 `rtpmech::ConstBuf`。所以编译本库的消费者
-不需要把 netmech 的头挂进 include 路径；**链接**时需要 `libnetmech.a`
+不需要把 netmech 的头挂进 include 路径；静态构建时**链接**需要 `libnetmech.a`
 （`find_package(rtpmech)` 会自动带出来）。
 
-想控制 io 线程数（默认 = CPU 核数）或与同进程其它库共用一份线程池，
-先 `#include <netmech/common.hpp>` 调一次 `netmech::initialize(n)`。
+想控制 io 线程数（默认 = CPU 核数）或与同进程其它库共用一份线程池，有两种方式：
+
+- **进程级默认池**：先 `#include <netmech/common.hpp>` 调一次 `netmech::initialize(n)`；
+- **显式注入**：`cfg.runtime = netmech::Runtime::create(...)`（见上方
+  「动态库与 Runtime 注入」一节），线程数与生命周期都归应用控制。
 
 > **安装约定（五个 mech 库统一）**：一个包只装自己，依赖由
 > `Config.cmake` 里的 `find_dependency` 声明、由使用者自己装。

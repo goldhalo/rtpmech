@@ -24,6 +24,30 @@
 
 - 默认安装前缀：Linux `/usr/local`，Windows `C:/Program Files/rtpmech`
 
+**动态库与 Runtime 注入（2026-11）**
+
+- `RTPMECH_LIBRARY_TYPE=STATIC|SHARED` + `RTPMECH_API` 导出宏（Windows
+  `dllexport/dllimport`，Linux hidden 可见性）；静态链入的 netmech 符号用
+  `-Wl,--exclude-libs,ALL` 隐藏；CI 增加 `Linux / gcc / Shared` job
+- `RtpSessionConfig::runtime`：显式注入 `netmech::Runtime`，io 线程数由应用决定；
+  netmech submodule 升级到支持 UDP 工厂 Runtime 重载的版本
+
+### 修复（2026-11 审查）
+
+- **RTP 时间戳**：新增 `send_frame()` / `send_frame_with_timestamp()` —— 一整帧
+  的所有分片共用同一个时间戳（之前 README 教逐分片 `send()`，时间戳会逐个前进）
+- **抖动**：`jitter_units` 更新漏乘 16，上报值只有 RFC 3550 A.8 的 1/16
+- **RTCP 定时器**：发送失败路径不推进调度 → 1ms 忙循环；无 `remote` 时不再启动定时器
+- **SSRC 自回环**：组播 loopback / 发给自己不再被误判为冲突（按最近发送序号识别）
+- **RTCP 复合包**：校验首个报文必须是 SR/RR；缺 SDES/CNAME 只计数不丢包
+- **其它**：显式时间戳推进游标、发送失败不空耗序号、扩展头字数截断校验、
+  SDES PRIV 跳过解析、`span` 空视图 `nullptr+0` UB
+
+### 测试
+
+- 用例 90 → 101、断言 461 → 536；新增 Packetizer+Session 集成（同帧同时间戳）、
+  抖动 RFC 精度、SSRC 自回环、RTCP 结构校验、Runtime 注入、扩展头截断、SDES PRIV 等用例
+
 ---
 
 ## [0.9.0] — 首个版本

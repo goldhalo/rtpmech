@@ -301,6 +301,11 @@ struct RtpSessionConfig {
     std::uint8_t multicast_hops     = 1;
     bool         multicast_loopback = true;
 
+    // ---- 运行时（可选） ----
+    /// 空 = 进程级默认运行时（线程数取 CPU 核数）；
+    /// 非空 = 本会话的 RTP/RTCP 端点跑在该 Runtime 的 io 线程上。
+    std::shared_ptr<netmech::Runtime> runtime;
+
     // ---- RTP ----
     std::uint32_t local_ssrc          = 0;      ///< 0 = 随机
     std::uint8_t  payload_type        = 96;
@@ -404,7 +409,7 @@ create(const RtpSessionConfig& cfg, std::shared_ptr<RtpHandler> handler,
 | 端口 | 绑定 RTP 与 RTCP（**RTCP = RTP + 1**），两个都成功才算成功；任一失败整体回滚 |
 | 失败回滚 | RTCP 失败会**关掉已绑的 RTP 端口**，保证可以重试 |
 | 线程 | RTP 端点正常创建，RTCP 端点用 `create_udp_endpoint_on(rtp, ...)` 跟随它的 io 线程 |
-| 前置条件 | 必须已 `netmech::initialize()` |
+| 前置条件 | 必须已 `netmech::initialize()`，或在 config 里注入 `runtime` |
 
 失败原因：`clock_rate == 0` / `recv_capacity == 0` / `max_packet_size < 64`（参数非法）、
 端口被占（系统错误码）。
@@ -416,6 +421,11 @@ SendResult send(netmech::ConstBuf payload, bool marker);
 SendResult send_with_timestamp(netmech::ConstBuf payload, bool marker,
                                std::uint32_t timestamp);
 SendResult send_to(const netmech::Address& dst, netmech::ConstBuf payload, bool marker);
+
+// 帧级发送：整帧交给 Packetizer 分片，所有分片共用同一个 RTP 时间戳。
+SendResult send_frame(span<const std::uint8_t> frame, Packetizer& packetizer);
+SendResult send_frame_with_timestamp(span<const std::uint8_t> frame,
+                                     Packetizer& packetizer, std::uint32_t timestamp);
 ```
 
 | 接口 | 说明 |

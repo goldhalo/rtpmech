@@ -60,8 +60,8 @@ set(RTPMECH_LIBRARY_TYPE "STATIC" CACHE STRING "库类型：STATIC 或 SHARED")
 
 # 位置无关代码。
 #
-# 本库只出静态库，但静态库常常被链进 .so。缺 -fPIC 时编静态库、跑单测都
-# 正常，**只在最终链 .so 那一步**报：
+# 默认出静态库（RTPMECH_LIBRARY_TYPE=SHARED 可切共享库）。静态库常被链进
+# .so：缺 -fPIC 时编静态库、跑单测都正常，**只在最终链 .so 那一步**报：
 #     relocation R_X86_64_PC32 against symbol `...' can not be used when
 #     making a shared object; recompile with -fPIC
 # 纯静态场景可 -DRTPMECH_PIC=OFF。
