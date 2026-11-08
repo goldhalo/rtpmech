@@ -58,6 +58,13 @@ option(RTPMECH_BUILD_BENCH    "构建压测工具" OFF)
 # 并给使用方定义 RTPMECH_SHARED（Windows 下切 dllimport）。
 set(RTPMECH_LIBRARY_TYPE "STATIC" CACHE STRING "库类型：STATIC 或 SHARED")
 
+# ★ SHARED 构建必须让 netmech 也以共享库提供：只静态链 netmech 的话，
+#   注入的 Runtime 会跨两份副本使用（netmech 文档明确禁止），同进程里
+#   其它 mech 库各自的 netmech 状态也不共享。add_subdirectory(netmech) 之前强制打开。
+if(RTPMECH_LIBRARY_TYPE STREQUAL "SHARED")
+    set(NETMECH_LIBRARY_TYPE "SHARED" CACHE STRING "netmech 库类型" FORCE)
+endif()
+
 # 位置无关代码。
 #
 # 默认出静态库（RTPMECH_LIBRARY_TYPE=SHARED 可切共享库）。静态库常被链进
