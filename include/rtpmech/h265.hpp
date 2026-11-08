@@ -24,6 +24,8 @@
 // =============================================================================
 #pragma once
 
+#include "rtpmech/export.hpp"
+
 #include <cstddef>
 #include <cstdint>
 #include <vector>
@@ -33,7 +35,7 @@
 namespace rtpmech {
 
 /// H.265 分片器。无状态，同上。
-class H265Packetizer final : public Packetizer {
+class RTPMECH_API H265Packetizer final : public Packetizer {
 public:
     struct Config {
         /// 整个 RTP 包的上限（含 12 字节 RTP 头）。默认 1400。

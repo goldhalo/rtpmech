@@ -15,6 +15,8 @@
 // =============================================================================
 #pragma once
 
+#include "rtpmech/export.hpp"
+
 #include <cstddef>
 #include <cstdint>
 #include <vector>
@@ -27,7 +29,7 @@ namespace rtpmech {
 ///
 /// 无状态（每次都从 frame 里重新拆 NAL），因此可以给多路复用 —— 但要保证
 /// 同一路不会并发调 `on_frame`。
-class H264Packetizer final : public Packetizer {
+class RTPMECH_API H264Packetizer final : public Packetizer {
 public:
     struct Config {
         /// **整个 RTP 包**的上限（含 RTP 头 12 字节）。

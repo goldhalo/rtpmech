@@ -346,3 +346,40 @@ target_link_libraries(app PRIVATE rtpmech::rtpmech)
 ## License
 
 MIT，见 [LICENSE](LICENSE)。
+
+## 动态库与 Runtime 注入
+
+### 构建成共享库
+
+```bash
+cmake -S . -B build-shared -DRTPMECH_LIBRARY_TYPE=SHARED
+cmake --build build-shared
+```
+
+- 公共 API 用 `RTPMECH_API` 导出（Windows `dllexport/dllimport`，Linux 配合
+  `CXX_VISIBILITY_PRESET=hidden`）；
+- 静态链入的 netmech 符号会被隐藏（`-Wl,--exclude-libs,ALL`），不会污染你的 ABI；
+- 对外发布时**不需要**附带 netmech 的二进制，但需保留 netmech 的 MIT 许可证声明。
+
+### 注入 io 运行时（线程数由应用决定）
+
+```cpp
+#include <netmech/runtime.hpp>
+
+netmech::Runtime::Options o;
+o.io_threads = 2;                      // 应用自己决定
+auto rt = netmech::Runtime::create(o);
+
+rtpmech::RtpSessionConfig cfg;
+cfg.local = rtpmech::Endpoint("0.0.0.0", 5000);
+cfg.runtime = rt;                      // ★ 本会话的 RTP/RTCP 端点都跑在 rt 上
+
+auto sess = rtpmech::RtpSession::create(cfg, handler, ec);
+// ... rt->shutdown() 之前先关闭会话
+```
+
+不传 `runtime` 时行为与以前一致（进程级默认运行时）。
+
+> **同进程多模块**（rtpmech + 其他依赖 netmech 的库）请让 netmech 以**共享库**
+> 形式被共用；多个模块各自静态链接 netmech 会得到多份运行时副本，跨副本注入
+> 会崩。详见 netmech 的 `docs/packaging.md`。

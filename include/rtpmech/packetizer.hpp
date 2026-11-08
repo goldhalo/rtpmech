@@ -21,6 +21,8 @@
 // =============================================================================
 #pragma once
 
+#include "rtpmech/export.hpp"
+
 #include <cstddef>
 #include <cstdint>
 #include <functional>
@@ -33,7 +35,7 @@ namespace rtpmech {
 ///
 /// 实现方负责把一段数据切成能塞进单个 RTP 包的 payload；库只保证
 /// `RtpSession::send()` 收到一个 payload 就发一个包。
-class Packetizer {
+class RTPMECH_API Packetizer {
 public:
     /// 输出回调。
     ///

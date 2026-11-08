@@ -17,6 +17,8 @@
 // =============================================================================
 #pragma once
 
+#include "rtpmech/export.hpp"
+
 #include <string>
 #include <system_error>
 
@@ -38,7 +40,7 @@ enum class RtpErrc {
 };
 
 /// rtpmech 的错误类别。
-[[nodiscard]] const std::error_category& rtp_category() noexcept;
+[[nodiscard]] RTPMECH_API const std::error_category& rtp_category() noexcept;
 
 /// 由 `RtpErrc` 构造 `std::error_code`。
 [[nodiscard]] inline std::error_code make_error_code(RtpErrc e) noexcept

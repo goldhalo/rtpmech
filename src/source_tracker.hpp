@@ -35,6 +35,8 @@
 // =============================================================================
 #pragma once
 
+#include <rtpmech/export.hpp>
+
 #include <chrono>
 #include <cstdint>
 #include <map>
@@ -54,7 +56,7 @@ namespace rtpmech {
 /// 一个远端源（SSRC）的接收状态与统计。
 ///
 /// 由 `SourceTracker` 在收到 RTP 包时更新。
-struct SourceStats {
+struct RTPMECH_API SourceStats {
     std::uint32_t ssrc = 0;
 
     // ---- 序列号跟踪（RFC 3550 A.1）----
@@ -113,7 +115,7 @@ struct SourceStats {
 ///
 /// 线程安全：**非线程安全**。调用方应保证在单一线程（或 strand）上使用。
 /// 这与 netmech 的"同一连接回调串行"约定一致。
-class SourceTracker {
+class RTPMECH_API SourceTracker {
 public:
     /// @param[in] local_ssrc 本次会话的本地 SSRC（自己的包不计入统计）。
     /// @param[in] clock_rate RTP 时钟频率（如视频 90000、音频 8000/48000）。

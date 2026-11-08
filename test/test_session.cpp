@@ -11,6 +11,7 @@
 // ============================================================================
 #include <rtpmech/rtpmech.hpp>
 #include <rtpmech/h264.hpp>
+#include <netmech/runtime.hpp>
 
 #include <netmech/net.hpp>
 
@@ -942,4 +943,43 @@ NETMECH_TEST(session_counts_rtcp_without_cname)
     CHECK_EQ(handler->count.load(), 1);
 
     sess->close();
+}
+
+// ---------------------------------------------------------------------------
+// 21. 注入 Runtime：io 线程数由应用决定，RTP/RTCP 端点跑在该 Runtime 上
+// ---------------------------------------------------------------------------
+NETMECH_TEST(session_accepts_injected_runtime)
+{
+    netmech::Runtime::Options opt;
+    opt.io_threads = 1;
+    auto rt = netmech::Runtime::create(opt);
+    REQUIRE(rt != nullptr);
+    CHECK_EQ(rt->io_threads(), std::size_t{1});
+
+    std::error_code ec;
+    auto collector = std::make_shared<Collector>();
+
+    auto rx_cfg      = base_cfg();
+    rx_cfg.enable_rtcp = false;
+    rx_cfg.runtime     = rt;
+    auto rx = RtpSession::create(rx_cfg, collector, ec);
+    REQUIRE(!ec);
+
+    auto tx_cfg        = base_cfg();
+    tx_cfg.enable_rtcp = false;
+    tx_cfg.runtime     = rt;
+    tx_cfg.remote      = Endpoint("127.0.0.1", rx->local_rtp_port());
+    auto tx = RtpSession::create(tx_cfg, std::make_shared<NullHandler>(), ec);
+    REQUIRE(!ec);
+
+    const std::uint8_t payload[8] = {1, 2, 3, 4, 5, 6, 7, 8};
+    CHECK_EQ(tx->send(ConstBuf{nullptr, payload, sizeof payload}, false),
+             SendResult::accepted);
+    REQUIRE(wait_for([&] { return collector->count.load() >= 1; }));
+    CHECK_EQ(collector->count.load(), 1);
+
+    tx->close();
+    rx->close();
+    rt->shutdown();
+    CHECK(!rt->running());
 }

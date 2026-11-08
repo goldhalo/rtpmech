@@ -387,3 +387,26 @@ NETMECH_TEST(span_empty_views_are_safe)
     const auto first = s.first(8);
     CHECK(first.empty());
 }
+
+// ---------------------------------------------------------------------------
+// 扩展头字数超过 16 位可表达范围：必须报 invalid_argument，不能静默截断
+// ---------------------------------------------------------------------------
+NETMECH_TEST(rtp_packet_rejects_oversized_extension)
+{
+    RtpPacketInfo info;
+    info.extension_profile = 0x1000;
+    // 0x10000 个 32 位字 = 262144 字节（length 字段放不下）
+    std::vector<std::uint8_t> ext(0x10000u * 4u, 0x00);
+    info.extension_data = span<const std::uint8_t>(ext.data(), ext.size());
+
+    std::error_code ec;
+    CHECK_EQ(rtp_packet_size(info, ec), std::size_t{0});
+    CHECK(ec == RtpErrc::invalid_argument);
+
+    std::vector<std::uint8_t> out(1024, 0);
+    ec.clear();
+    CHECK_EQ(build_rtp_packet(out.data(), out.size(), info,
+                              span<const std::uint8_t>{}, ec),
+             std::size_t{0});
+    CHECK(ec == RtpErrc::invalid_argument);
+}

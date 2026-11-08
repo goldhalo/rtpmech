@@ -53,6 +53,11 @@ option(RTPMECH_BUILD_EXAMPLES "构建 rtpmech 示例" ON)
 option(RTPMECH_WARNINGS_AS_ERRORS "把编译告警当错误（CI 用）" OFF)
 option(RTPMECH_BUILD_BENCH    "构建压测工具" OFF)
 
+# 库类型：STATIC（默认）/ SHARED。
+# SHARED 时公共 API 加 RTPMECH_API 导出宏、隐藏静态链入的 netmech 符号，
+# 并给使用方定义 RTPMECH_SHARED（Windows 下切 dllimport）。
+set(RTPMECH_LIBRARY_TYPE "STATIC" CACHE STRING "库类型：STATIC 或 SHARED")
+
 # 位置无关代码。
 #
 # 本库只出静态库，但静态库常常被链进 .so。缺 -fPIC 时编静态库、跑单测都
@@ -132,7 +137,7 @@ endif()
 file(GLOB_RECURSE RTPMECH_SOURCES CONFIGURE_DEPENDS
      "${CMAKE_CURRENT_SOURCE_DIR}/src/*.cpp")
 
-add_library(rtpmech STATIC ${RTPMECH_SOURCES})
+add_library(rtpmech ${RTPMECH_LIBRARY_TYPE} ${RTPMECH_SOURCES})
 add_library(rtpmech::rtpmech ALIAS rtpmech)
 set_target_properties(rtpmech PROPERTIES
     POSITION_INDEPENDENT_CODE ${RTPMECH_PIC})
@@ -165,6 +170,25 @@ target_link_libraries(rtpmech
 target_compile_features(rtpmech PUBLIC cxx_std_17)
 
 set_target_properties(rtpmech PROPERTIES FOLDER "rtpmech")
+
+# ---------------------------------------------------------------------------
+# 共享库的符号卫生（与 modbusmech 一致）
+# ---------------------------------------------------------------------------
+if(RTPMECH_LIBRARY_TYPE STREQUAL "SHARED")
+    target_compile_definitions(rtpmech PUBLIC RTPMECH_SHARED)
+    target_compile_definitions(rtpmech PRIVATE RTPMECH_BUILDING_LIBRARY)
+    set_target_properties(rtpmech PROPERTIES
+        CXX_VISIBILITY_PRESET hidden
+        VISIBILITY_INLINES_HIDDEN ON)
+    if(MSVC)
+        target_compile_options(rtpmech PRIVATE /wd4251)
+    elseif(UNIX AND NOT APPLE)
+        # netmech 是静态链入本库的，默认可见性会把它的内部符号全部导出。
+        target_link_options(rtpmech PRIVATE "-Wl,--exclude-libs,ALL")
+    elseif(APPLE)
+        target_link_options(rtpmech PRIVATE "-Wl,-hidden-lsymbols")
+    endif()
+endif()
 
 # ---------------------------------------------------------------------------
 # 5. 测试

@@ -28,6 +28,8 @@
 // =============================================================================
 #pragma once
 
+#include "rtpmech/export.hpp"
+
 #include <array>
 #include <cstddef>
 #include <cstdint>
@@ -72,7 +74,7 @@ inline constexpr std::size_t kMaxCsrcCount = 15;
 ///   * 从网络回调里拿到数据后，应在回调内完成处理或复制出需要的内容。
 ///
 /// @note 解析时不做任何内存分配（CSRC 列表以 span 视图暴露）。
-class RtpPacket {
+class RTPMECH_API RtpPacket {
 public:
     /// 解析结果：成功返回 RtpPacket，失败返回错误码。
     ///
@@ -217,7 +219,7 @@ struct RtpPacketInfo {
 /// 计算构造该包所需的缓冲区大小。
 ///
 /// @return 所需字节数；参数非法时返回 0 并设置 ec。
-[[nodiscard]] std::size_t
+[[nodiscard]] RTPMECH_API std::size_t
 rtp_packet_size(const RtpPacketInfo& info, std::error_code& ec) noexcept;
 
 /// 构造 RTP 包到调用方提供的缓冲区。
@@ -231,7 +233,7 @@ rtp_packet_size(const RtpPacketInfo& info, std::error_code& ec) noexcept;
 /// @return 写入的字节数；失败返回 0。
 ///
 /// @note 头中所有多字节字段按**网络字节序**（大端）写入。
-[[nodiscard]] std::size_t
+[[nodiscard]] RTPMECH_API std::size_t
 build_rtp_packet(std::uint8_t* out, std::size_t capacity,
                  const RtpPacketInfo& info,
                  span<const std::uint8_t> payload,

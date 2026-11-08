@@ -306,6 +306,14 @@ RtcpPacket::parse_single(const std::uint8_t* data, std::size_t len,
                     ec = make_error_code(RtpErrc::invalid_packet);
                     return std::nullopt;
                 }
+                // PRIV（type=8）是 prefix_len + prefix + value，与普通条目
+                // 的 "len + value" 语义不同。跳过不解析（见头文件说明），
+                // 但仍按 len 前进，保证后续条目/下一个 chunk 的边界正确。
+                if (item_type == static_cast<std::uint8_t>(SdesType::priv)) {
+                    off += 2 + item_len;
+                    continue;
+                }
+
                 std::string value(
                     reinterpret_cast<const char*>(body + off + 2), item_len);
 

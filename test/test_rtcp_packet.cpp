@@ -549,3 +549,33 @@ NETMECH_TEST(rtcp_ntp_normalizes_out_of_range_nanoseconds)
     CHECK_EQ(sec, std::int64_t{8});
     CHECK_EQ(nano, 0u);
 }
+
+// ---------------------------------------------------------------------------
+// SDES PRIV 项按 RFC 是 prefix_len + prefix + value：解析时跳过，不放进 items，
+// 也不能影响后面条目/chunk 的边界。
+// ---------------------------------------------------------------------------
+NETMECH_TEST(rtcp_sdes_priv_is_skipped)
+{
+    SdesReport sdes;
+    SdesChunk chunk;
+    chunk.ssrc  = 0x11223344;
+    chunk.cname = "abc";
+    chunk.items.emplace_back(SdesType::priv, std::string("pxyz"));
+    sdes.chunks.push_back(chunk);
+
+    std::vector<std::uint8_t> buf(256, 0);
+    std::error_code ec;
+    const std::size_t n = build_rtcp_sdes(buf.data(), buf.size(), sdes, ec);
+    REQUIRE(!ec);
+    REQUIRE(n > 0);
+
+    std::size_t consumed = 0;
+    auto pkt = RtcpPacket::parse_single(buf.data(), n, consumed, ec);
+    REQUIRE(pkt.has_value());
+    REQUIRE(!ec);
+    const SdesReport* parsed = pkt->as_sdes();
+    REQUIRE(parsed != nullptr);
+    REQUIRE(parsed->chunks.size() == 1u);
+    CHECK_EQ(parsed->chunks[0].cname, std::string("abc"));
+    CHECK(parsed->chunks[0].items.empty());   // PRIV 被跳过
+}

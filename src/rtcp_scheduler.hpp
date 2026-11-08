@@ -40,6 +40,8 @@
 // =============================================================================
 #pragma once
 
+#include <rtpmech/export.hpp>
+
 #include <cstddef>
 #include <cstdint>
 #include <random>
@@ -101,7 +103,7 @@ struct RtcpSchedulerParams {
 /// ```
 ///
 /// @note 非线程安全，应在单一线程（或 strand）上使用。
-class RtcpScheduler {
+class RTPMECH_API RtcpScheduler {
 public:
     explicit RtcpScheduler(RtcpSchedulerParams params = {}) noexcept;
 

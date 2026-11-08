@@ -498,6 +498,8 @@ public:
         }
 
         note_sent_seq(info.sequence);
+        sent_since_report_ = true;
+        last_sent_ts_      = info.timestamp;
         rtp_sent_.fetch_add(1, std::memory_order_relaxed);
         octet_sent_.fetch_add(payload.size, std::memory_order_relaxed);
         return SendResult::accepted;
@@ -555,6 +557,7 @@ public:
         const netmech::Address dst = detail::to_address(*cfg_.remote);
 
         bool        failed = false;
+        bool        sent_any = false;
         std::size_t octets = 0;
 
         packetizer.on_frame(frame, [&](span<const std::uint8_t> payload, bool marker) {
@@ -583,11 +586,16 @@ public:
                 return;
             }
             note_sent_seq(info.sequence);
+            sent_any = true;
             rtp_sent_.fetch_add(1, std::memory_order_relaxed);
             octets += payload.size();
         });
 
         octet_sent_.fetch_add(octets, std::memory_order_relaxed);
+        if (sent_any) {
+            sent_since_report_ = true;
+            last_sent_ts_      = ts;
+        }
         if (failed) {
             send_rejected_.fetch_add(1, std::memory_order_relaxed);
             return SendResult::closed;
@@ -627,8 +635,11 @@ public:
         // 参与者数喂给调度器：它据此算共享带宽份额与自适应间隔。
         // 以前写死 (1, 1) —— 调度算法本身是对的（rtcp_scheduler.cpp），
         // 但没有输入，退化成固定间隔。members 含本端自己。
+        // is_sender 必须按"自上次报告以来"判断，并且要在喂调度器之前算：
+        // 本端不是发送者时，senders 里不该把自己算进去。
+        const bool is_sender = sent_since_report_;
         scheduler_.update_members(tracker_.size() + 1,
-                                  tracker_.sender_count() + 1);
+                                  tracker_.sender_count() + (is_sender ? 1u : 0u));
         sync_tracker_stats();
 
         const auto blocks = tracker_.build_report_blocks();
@@ -638,12 +649,6 @@ public:
         std::error_code ec;
 
         const std::uint32_t local_ssrc = ssrc_.load(std::memory_order_acquire);
-
-        // ★ RFC 3550 §6.4：自上次报告以来**没发过数据**的一方应当发 RR。
-        //   以前无条件发 SR —— 只收不发的会话（典型：监控端 / 纯播放端）会把
-        //   自己伪装成发送者，污染对端的 sender_count，进而算错 25%/75%
-        //   的 RTCP 带宽配额。build_rtcp_receiver_report 早就写好了，只是没人用。
-        const bool is_sender = rtp_sent_.load(std::memory_order_relaxed) > 0;
 
         NtpTime local_sr_ntp{};
         if (is_sender) {
@@ -658,7 +663,9 @@ public:
                 local_sr_ntp     = make_ntp_time(secs, static_cast<std::uint32_t>(nanos));
                 sr.ntp_msw       = local_sr_ntp.seconds;
                 sr.ntp_lsw       = local_sr_ntp.fraction;
-                sr.rtp_timestamp = current_timestamp();
+                // 用**最后实际发出**的时间戳：current_timestamp() 在固定增量
+                // 模式下是"下一帧"的预分配值，与本次 NTP 时刻对不上。
+                sr.rtp_timestamp = last_sent_ts_;
                 sr.packet_count  = static_cast<std::uint32_t>(rtp_sent_.load());
                 sr.octet_count   = static_cast<std::uint32_t>(octet_sent_.load());
             }
@@ -716,6 +723,9 @@ public:
 
         // 告诉调度器"发出去了、多大"，它据此更新平均包大小并排下一拍
         scheduler_.on_rtcp_sent(off, steady_now_sec());
+        if (is_sender) {
+            sent_since_report_ = false;   // 本报告已覆盖之前的发送
+        }
         return true;
     }
 
@@ -980,8 +990,10 @@ private:
         cfg.multicast_hops      = cfg_.multicast_hops;
         cfg.multicast_loopback  = cfg_.multicast_loopback;
 
+        // 注入的 Runtime 决定这一路 RTP/RTCP 的 io 线程；nullptr = 默认运行时。
+        // RTCP 端点用 create_udp_endpoint_on 跟随 RTP 的 io_context，无需再传。
         rtp_ep_ = netmech::create_udp_endpoint(
-            cfg, std::make_shared<RtpSink>(weak_from_this()), nullptr, ec);
+            cfg, std::make_shared<RtpSink>(weak_from_this()), nullptr, cfg_.runtime, ec);
         if (!rtp_ep_) {
             return false;
         }
@@ -1132,6 +1144,11 @@ private:
     std::atomic<bool>          closed_{false};
 
     std::uint32_t              ts_base_      = 0;
+    /// 自上次报告以来是否发过 RTP（RFC 3550 §6.4：SR 的判据是
+    /// "自上次报告以来发过数据"，不是"历史上发过"）。
+    bool                       sent_since_report_ = false;
+    /// 最近一次实际发出的 RTP 时间戳（SR 里应当填它，而不是"下一帧"的预分配值）。
+    std::uint32_t              last_sent_ts_ = 0;
     std::uint32_t              ts_current_   = 0;
     std::uint32_t              ts_increment_ = 0;
     steady_clock_t::time_point first_send_time_{};

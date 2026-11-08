@@ -16,6 +16,10 @@
 // =============================================================================
 #pragma once
 
+#include "rtpmech/export.hpp"
+
+namespace netmech { class Runtime; }
+
 #include <cstdint>
 #include <memory>
 #include <system_error>
@@ -89,6 +93,21 @@ struct RtpSessionConfig {
     std::optional<Endpoint> multicast_interface;
     std::uint8_t multicast_hops     = 1;
     bool         multicast_loopback = true;
+
+    // ---- 运行时（可选） ----
+
+    /// 注入 netmech 的 io 运行时（`netmech/runtime.hpp`）。
+    ///
+    /// - 空（默认）：用进程级默认运行时，线程数取 CPU 核数；
+    /// - 非空：本会话的 RTP/RTCP 端点都跑在**这个 Runtime** 的 io 线程上，
+    ///   线程数由应用决定（同进程多协议库时用来共享/隔离 io 池）。
+    ///
+    /// @note 本头文件只前向声明 `netmech::Runtime`（保持"公共头不引 netmech"），
+    ///       创建 Runtime 需要包含 `<netmech/runtime.hpp>`。
+    ///
+    /// @warning 同一进程里多个模块**静态链接** netmech 时不要跨副本注入
+    ///          （每份副本有自己的线程局部状态，见 netmech 的 runtime.hpp）。
+    std::shared_ptr<netmech::Runtime> runtime;
 
     // ---- RTP ----
 
@@ -175,7 +194,7 @@ struct RtpSessionConfig {
 // =============================================================================
 
 /// 一个 RTP 会话上的事件。全部在该会话的 io 线程上回调，**同一会话严格串行**。
-class RtpHandler {
+class RTPMECH_API RtpHandler {
 public:
     virtual ~RtpHandler() = default;
 
@@ -273,7 +292,7 @@ struct RtpSessionStats {
 ///
 ///  自己发出的包被回环回来（序号落在最近发送窗口内）**不算**冲突，
 ///  会被识别并忽略（组播 loopback / 发给自己）。
-class RtpSession {
+class RTPMECH_API RtpSession {
 public:
     /// 创建会话。
     ///

@@ -248,6 +248,39 @@ jobs:
         run: ctest --test-dir build-tsan --output-on-failure --timeout 300
 
   # ---------------------------------------------------------------------------
+  # 共享库构建（-DRTPMECH_LIBRARY_TYPE=SHARED）
+  # ---------------------------------------------------------------------------
+  shared:
+    name: Linux / gcc / Shared
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    steps:
+      - name: 检出（含 netmech submodule）
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: 安装工具
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y cmake ninja-build g++
+
+      - name: 配置（Debug + SHARED）
+        run: |
+          export CC=gcc CXX=g++
+          cmake -S . -B build-shared -G Ninja \
+                -DCMAKE_BUILD_TYPE=Debug \
+                -DRTPMECH_LIBRARY_TYPE=SHARED \
+                -DRTPMECH_WARNINGS_AS_ERRORS=ON
+
+      - name: 构建
+        run: cmake --build build-shared --parallel
+
+      - name: 测试（链接 libRtpmech.so）
+        run: ctest --test-dir build-shared --output-on-failure --timeout 120
+
+  # ---------------------------------------------------------------------------
   # 质量门禁
   # ---------------------------------------------------------------------------
   quality:

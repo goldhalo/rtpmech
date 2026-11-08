@@ -25,6 +25,8 @@
 // =============================================================================
 #pragma once
 
+#include "rtpmech/export.hpp"
+
 #include <array>
 #include <cstddef>
 #include <cstdint>
@@ -54,7 +56,7 @@ enum class RtcpType : std::uint8_t {
 };
 
 /// 把 RTCP 类型转成可读名字（诊断用）。
-[[nodiscard]] const char* rtcp_type_name(RtcpType t) noexcept;
+[[nodiscard]] RTPMECH_API const char* rtcp_type_name(RtcpType t) noexcept;
 
 /// 通用头长度（V/P/RC + PT + Length）。
 inline constexpr std::size_t kRtcpCommonHeaderSize = 4;
@@ -95,7 +97,12 @@ struct SdesChunk {
     std::uint32_t ssrc = 0;
     /// CNAME（RFC 3550 要求每个复合包必须包含）
     std::string   cname;
-    /// 其他可选条目（原始类型 + 值）
+    /// 其他可选条目（原始类型 + 值）。
+    ///
+    /// @note `SdesType::priv`（PRIV）在 RFC 3550 §6.5 里是
+    ///       `prefix_len + prefix + value` 的结构，与普通字符串条目的
+    ///       "长度 + 值"不同。本实现解析时**跳过 PRIV 项**（不放进 items），
+    ///       避免把 prefix 误当 value；构造侧也不会生成 PRIV。
     std::vector<std::pair<SdesType, std::string>> items;
 };
 
@@ -147,7 +154,7 @@ struct AppReport {
 ///
 /// 使用显式类型标签而非 std::variant —— 因为要携带解析出的具体结构体，
 /// variant 会更冗长且增加编译期开销。
-class RtcpPacket {
+class RTPMECH_API RtcpPacket {
 public:
     /// 报文类型。
     [[nodiscard]] RtcpType type() const noexcept { return type_; }
@@ -196,7 +203,7 @@ private:
 };
 
 /// 一个 RTCP 复合包（多个 RTCP 报文的序列）。
-class RtcpCompoundPacket {
+class RTPMECH_API RtcpCompoundPacket {
 public:
     /// 解析整个数据报为复合包。
     ///
@@ -231,30 +238,30 @@ private:
 // -----------------------------------------------------------------------------
 
 /// 计算某类 RTCP 报文所需的缓冲区大小。
-[[nodiscard]] std::size_t rtcp_sender_report_size(const SenderReport&) noexcept;
-[[nodiscard]] std::size_t rtcp_receiver_report_size(const ReceiverReport&) noexcept;
-[[nodiscard]] std::size_t rtcp_sdes_size(const SdesReport&) noexcept;
-[[nodiscard]] std::size_t rtcp_bye_size(const ByeReport&) noexcept;
-[[nodiscard]] std::size_t rtcp_app_size(const AppReport&) noexcept;
+[[nodiscard]] RTPMECH_API std::size_t rtcp_sender_report_size(const SenderReport&) noexcept;
+[[nodiscard]] RTPMECH_API std::size_t rtcp_receiver_report_size(const ReceiverReport&) noexcept;
+[[nodiscard]] RTPMECH_API std::size_t rtcp_sdes_size(const SdesReport&) noexcept;
+[[nodiscard]] RTPMECH_API std::size_t rtcp_bye_size(const ByeReport&) noexcept;
+[[nodiscard]] RTPMECH_API std::size_t rtcp_app_size(const AppReport&) noexcept;
 
 /// 构造各类 RTCP 报文到输出缓冲区。
 ///
 /// @return 写入字节数；失败返回 0 并设置 ec。
 ///
 /// @note 长度自动补齐到 32 位字，Length 字段自动填写为 (bytes/4 - 1)。
-[[nodiscard]] std::size_t build_rtcp_sender_report(
+[[nodiscard]] RTPMECH_API std::size_t build_rtcp_sender_report(
     std::uint8_t* out, std::size_t cap, const SenderReport&, std::error_code&) noexcept;
 
-[[nodiscard]] std::size_t build_rtcp_receiver_report(
+[[nodiscard]] RTPMECH_API std::size_t build_rtcp_receiver_report(
     std::uint8_t* out, std::size_t cap, const ReceiverReport&, std::error_code&) noexcept;
 
-[[nodiscard]] std::size_t build_rtcp_sdes(
+[[nodiscard]] RTPMECH_API std::size_t build_rtcp_sdes(
     std::uint8_t* out, std::size_t cap, const SdesReport&, std::error_code&) noexcept;
 
-[[nodiscard]] std::size_t build_rtcp_bye(
+[[nodiscard]] RTPMECH_API std::size_t build_rtcp_bye(
     std::uint8_t* out, std::size_t cap, const ByeReport&, std::error_code&) noexcept;
 
-[[nodiscard]] std::size_t build_rtcp_app(
+[[nodiscard]] RTPMECH_API std::size_t build_rtcp_app(
     std::uint8_t* out, std::size_t cap, const AppReport&, std::error_code&) noexcept;
 
 // -----------------------------------------------------------------------------
@@ -270,11 +277,11 @@ struct NtpTime {
 /// 由 Unix 时间（秒 + 纳秒）构造 NTP 时间戳。
 ///
 /// @note NTP 纪元是 1900-01-01，Unix 纪元是 1970-01-01，相差 2208988800 秒。
-[[nodiscard]] NtpTime make_ntp_time(std::int64_t unix_sec,
+[[nodiscard]] RTPMECH_API NtpTime make_ntp_time(std::int64_t unix_sec,
                                     std::uint32_t nano_sec) noexcept;
 
 /// 由 NTP 时间戳还原 Unix 时间（秒 + 纳秒）。
-void split_ntp_time(const NtpTime& ntp, std::int64_t& unix_sec,
+RTPMECH_API void split_ntp_time(const NtpTime& ntp, std::int64_t& unix_sec,
                     std::uint32_t& nano_sec) noexcept;
 
 /// NTP 纪元与 Unix 纪元相差的秒数。

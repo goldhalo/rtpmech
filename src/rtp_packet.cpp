@@ -182,6 +182,12 @@ std::size_t rtp_packet_size(const RtpPacketInfo& info,
     if (!info.extension_data.empty()) {
         // 扩展数据按 32 位字对齐（不足补零）
         const std::size_t ext_words = (info.extension_data.size() + 3) / 4;
+        // 扩展头的 length 字段只有 16 位（单位 32 位字）。超了就拒收，
+        // 以前写回 uint16 时静默截断，构造端与解析端长度对不上。
+        if (ext_words > 0xFFFFu) {
+            ec = make_error_code(RtpErrc::invalid_argument);
+            return 0;
+        }
         size += kRtpExtensionHeaderSize + ext_words * 4;
     }
 
