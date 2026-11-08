@@ -648,24 +648,45 @@ NETMECH_TEST(session_rtt_measured_when_only_one_side_sends)
 // ---------------------------------------------------------------------------
 NETMECH_TEST(session_rtt_measured_between_two_senders)
 {
-    const auto base = netmech::find_free_port_run(40000, 50000, 4, 2);
-    REQUIRE(base.has_value());
+    // ★ 端口是「探测后绑定」的（TOCTOU）：Windows 上偶尔会在 A 绑上之后
+    //   B 侧端口被别人/上一轮收尾中的 socket 占住。重试几次换一段端口，
+    //   不把环境抖动当成库的失败。
+    std::shared_ptr<RtpSession> a;
+    std::shared_ptr<RtpSession> b;
+    for (int attempt = 0; attempt < 5 && (!a || !b); ++attempt) {
+        if (attempt > 0) {
+            // 上一次失败可能是端口刚被动过：给收尾/释放留一点时间
+            std::this_thread::sleep_for(std::chrono::milliseconds(20));
+        }
+        const auto base = netmech::find_free_port_run(40000, 50000, 4, 2);
+        REQUIRE(base.has_value());
 
-    std::error_code ec;
+        std::error_code ec;
 
-    auto cfg_a        = base_cfg();
-    cfg_a.local       = Endpoint("127.0.0.1", *base);
-    cfg_a.remote      = Endpoint("127.0.0.1", static_cast<std::uint16_t>(*base + 2));
-    cfg_a.enable_rtcp = true;
-    auto a = RtpSession::create(cfg_a, std::make_shared<NullHandler>(), ec);
-    REQUIRE(!ec);
+        auto cfg_a        = base_cfg();
+        cfg_a.local       = Endpoint("127.0.0.1", *base);
+        cfg_a.remote      = Endpoint("127.0.0.1", static_cast<std::uint16_t>(*base + 2));
+        cfg_a.enable_rtcp = true;
+        a = RtpSession::create(cfg_a, std::make_shared<NullHandler>(), ec);
+        if (ec) {
+            a.reset();
+            continue;
+        }
 
-    auto cfg_b        = base_cfg();
-    cfg_b.local       = Endpoint("127.0.0.1", static_cast<std::uint16_t>(*base + 2));
-    cfg_b.remote      = Endpoint("127.0.0.1", *base);
-    cfg_b.enable_rtcp = true;
-    auto b = RtpSession::create(cfg_b, std::make_shared<NullHandler>(), ec);
-    REQUIRE(!ec);
+        auto cfg_b        = base_cfg();
+        cfg_b.local       = Endpoint("127.0.0.1", static_cast<std::uint16_t>(*base + 2));
+        cfg_b.remote      = Endpoint("127.0.0.1", *base);
+        cfg_b.enable_rtcp = true;
+        b = RtpSession::create(cfg_b, std::make_shared<NullHandler>(), ec);
+        if (ec) {
+            b.reset();
+            a->close();
+            a.reset();
+            continue;
+        }
+    }
+    REQUIRE(a != nullptr);
+    REQUIRE(b != nullptr);
 
     const std::uint8_t payload[4] = {0x55, 0x66, 0x77, 0x88};
     for (int i = 0; i < 3; ++i) {
