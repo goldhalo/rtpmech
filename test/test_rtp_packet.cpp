@@ -369,3 +369,21 @@ NETMECH_TEST(rtp_build_network_byte_order)
     CHECK_EQ(buf[10], 0x0C);
     CHECK_EQ(buf[11], 0x0D);
 }
+
+// ---------------------------------------------------------------------------
+// span 空视图：end()/subspan 不能做 nullptr + 0（UBSan pointer-overflow）
+// ---------------------------------------------------------------------------
+NETMECH_TEST(span_empty_views_are_safe)
+{
+    rtpmech::span<const std::uint8_t> s;
+    CHECK(s.empty());
+    CHECK(s.begin() == nullptr);
+    CHECK(s.end() == nullptr);
+
+    const auto sub = s.subspan(0, 0);
+    CHECK(sub.empty());
+    CHECK(sub.data() == nullptr);
+
+    const auto first = s.first(8);
+    CHECK(first.empty());
+}

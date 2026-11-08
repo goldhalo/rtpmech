@@ -230,6 +230,12 @@ struct RtpSessionStats {
     /// 这些包会被识别并忽略：不算 SSRC 冲突、不回调 on_packet。
     std::uint64_t self_loopback_ignored = 0;
 
+    /// 真正发生 SSRC 冲突并换号的次数（RFC 3550 §8.2）。
+    std::uint64_t ssrc_collisions = 0;
+    /// 收到的 RTCP 复合包缺少 SDES/CNAME 的次数。
+    /// 协议上属于违规，但不少设备/网关会省 —— 只计数，不丢包（保互操作）。
+    std::uint64_t rtcp_without_cname = 0;
+
     std::size_t   active_sources = 0;  ///< 当前跟踪的远端源数量
     std::optional<std::uint32_t> rtt_us; ///< 最近一次测得的 RTT（微秒）
 };
@@ -265,7 +271,8 @@ struct RtpSessionStats {
 ///  - 若此前已经用该 SSRC 发过数据 → 先发一个 RTCP BYE；
 ///  - 然后换一个新的随机 SSRC 继续。
 ///
-///  同一来源地址重复出现**不算**冲突（那是自己发的包回环）。
+///  自己发出的包被回环回来（序号落在最近发送窗口内）**不算**冲突，
+///  会被识别并忽略（组播 loopback / 发给自己）。
 class RtpSession {
 public:
     /// 创建会话。

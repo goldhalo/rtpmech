@@ -799,3 +799,147 @@ NETMECH_TEST(session_rtcp_without_remote_does_not_spin)
 
     sess->close();
 }
+
+// ---------------------------------------------------------------------------
+// 18. 显式时间戳也要推进内部游标（否则之后 send() 会拿到旧时间戳）
+// ---------------------------------------------------------------------------
+NETMECH_TEST(session_explicit_timestamp_advances_cursor)
+{
+    std::error_code ec;
+    auto collector = std::make_shared<Collector>();
+    auto rx = RtpSession::create(base_cfg(), collector, ec);
+    REQUIRE(!ec);
+
+    auto cfg = base_cfg();
+    cfg.remote = Endpoint("127.0.0.1", rx->local_rtp_port());
+    cfg.timestamp_increment = 3600;
+    auto tx = RtpSession::create(cfg, std::make_shared<NullHandler>(), ec);
+    REQUIRE(!ec);
+
+    const std::uint8_t payload[8] = {};
+    CHECK_EQ(tx->send_with_timestamp(ConstBuf{nullptr, payload, sizeof payload}, false,
+                                     /*timestamp=*/100000),
+             SendResult::accepted);
+    REQUIRE(wait_for([&] { return collector->count.load() >= 1; }));
+
+    CHECK_EQ(tx->send(ConstBuf{nullptr, payload, sizeof payload}, false),
+             SendResult::accepted);
+    REQUIRE(wait_for([&] { return collector->count.load() >= 2; }));
+
+    std::lock_guard<std::mutex> lk(collector->mtx);
+    REQUIRE(collector->timestamps.size() >= 2u);
+    CHECK_EQ(collector->timestamps[0], 100000u);
+    CHECK_EQ(collector->timestamps[1], 103600u);   // 100000 + 3600
+
+    tx->close();
+    rx->close();
+}
+
+// ---------------------------------------------------------------------------
+// 19. RTCP 复合包：第一个报文不是 SR/RR 时必须丢弃（RFC 3550 §6.1）
+// ---------------------------------------------------------------------------
+namespace {
+class RtcpCountHandler : public RtpHandler {
+public:
+    void on_packet(RtpSession&, const RtpPacket&, const Endpoint&) override {}
+    void on_rtcp(RtpSession&, const RtcpCompoundPacket&, const Endpoint&) override
+    {
+        count.fetch_add(1);
+    }
+    std::atomic<int> count{0};
+};
+
+/// 发裸 RTCP 用的最简接收者（netmech 要求 handler 非空才会创建端点）。
+class DiscardUdpHandler : public netmech::UdpHandler {
+public:
+    void on_read(netmech::UdpEndpoint&, std::error_code, netmech::Buf,
+                 std::size_t, const netmech::Address&) override
+    {
+    }
+};
+
+/// 从任意 UDP 端点把裸字节发给指定端口（模拟对端发 RTCP）。
+///
+/// 返回端点本身：`send_to` 是异步的，端点必须在包真正发出前保持存活，
+/// 否则刚创建就析构会把待发数据一起丢掉。
+std::shared_ptr<netmech::UdpEndpoint>
+send_raw_udp(std::uint16_t port, const std::vector<std::uint8_t>& bytes)
+{
+    netmech::UdpConfig uc;
+    uc.bind = netmech::Address("127.0.0.1", 0);
+    std::error_code ec;
+    auto ep = netmech::create_udp_endpoint(
+        uc, std::make_shared<DiscardUdpHandler>(), nullptr, ec);
+    if (!ep) {
+        return nullptr;
+    }
+    (void)ep->send_to(netmech::Address("127.0.0.1", port),
+                      netmech::ConstBuf{nullptr, bytes.data(), bytes.size()});
+    return ep;
+}
+} // namespace
+
+NETMECH_TEST(session_rejects_rtcp_without_sr_rr_first)
+{
+    std::error_code ec;
+    auto handler = std::make_shared<RtcpCountHandler>();
+    auto cfg = base_cfg();
+    cfg.enable_rtcp = true;
+    auto sess = RtpSession::create(cfg, handler, ec);
+    REQUIRE(!ec);
+
+    // 构造一个"以 SDES 开头"的复合包（顺序违规）
+    std::vector<std::uint8_t> buf(256);
+    SdesReport sdes;
+    SdesChunk chunk;
+    chunk.ssrc  = 0x01020304;
+    chunk.cname = "bad";
+    sdes.chunks.push_back(chunk);
+
+    std::error_code bec;
+    const auto n = build_rtcp_sdes(buf.data(), buf.size(), sdes, bec);
+    REQUIRE(!bec);
+    REQUIRE(n > 0);
+    buf.resize(n);
+
+    auto raw_ep = send_raw_udp(sess->local_rtcp_port(), buf);
+
+    REQUIRE(wait_for([&] { return sess->stats().parse_errors >= 1u; }, 1500ms));
+    if (raw_ep) { raw_ep->close(); }
+    CHECK_EQ(sess->stats().rtcp_received, std::uint64_t{0});
+    CHECK_EQ(handler->count.load(), 0);
+
+    sess->close();
+}
+
+// ---------------------------------------------------------------------------
+// 20. RTCP 复合包：缺少 SDES/CNAME 只计数、不丢包（保互操作）
+// ---------------------------------------------------------------------------
+NETMECH_TEST(session_counts_rtcp_without_cname)
+{
+    std::error_code ec;
+    auto handler = std::make_shared<RtcpCountHandler>();
+    auto cfg = base_cfg();
+    cfg.enable_rtcp = true;
+    auto sess = RtpSession::create(cfg, handler, ec);
+    REQUIRE(!ec);
+
+    // 只有一个 SR、没有 SDES(CNAME)
+    std::vector<std::uint8_t> buf(256);
+    SenderReport sr;
+    sr.ssrc = 0x0A0B0C0D;
+    std::error_code bec;
+    const auto n = build_rtcp_sender_report(buf.data(), buf.size(), sr, bec);
+    REQUIRE(!bec);
+    REQUIRE(n > 0);
+    buf.resize(n);
+
+    auto raw_ep = send_raw_udp(sess->local_rtcp_port(), buf);
+
+    REQUIRE(wait_for([&] { return sess->stats().rtcp_received >= 1u; }, 1500ms));
+    if (raw_ep) { raw_ep->close(); }
+    CHECK(sess->stats().rtcp_without_cname >= 1u);
+    CHECK_EQ(handler->count.load(), 1);
+
+    sess->close();
+}

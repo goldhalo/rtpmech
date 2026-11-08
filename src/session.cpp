@@ -306,6 +306,21 @@ public:
             parse_errors_.fetch_add(1, std::memory_order_relaxed);
             return;
         }
+
+        // RFC 3550 §6.1：复合包第一个报文必须是 SR 或 RR。顺序错说明对方
+        // 实现有问题（或数据被伪造/错位），整包丢弃，不进 tracker。
+        const auto& pkts = compound->packets();
+        if (pkts.empty() ||
+            (pkts.front().type() != RtcpType::sender_report &&
+             pkts.front().type() != RtcpType::receiver_report)) {
+            parse_errors_.fetch_add(1, std::memory_order_relaxed);
+            return;
+        }
+        if (!compound->has_cname()) {
+            // CNAME 缺失属于协议违规，但不少设备/网关会省；只计数不丢包，
+            // 避免为一条可容忍的违规把整条 RTCP 反馈链断掉。
+            rtcp_without_cname_.fetch_add(1, std::memory_order_relaxed);
+        }
         rtcp_received_.fetch_add(1, std::memory_order_relaxed);
 
         // ★ 先把报文喂给源跟踪器。
@@ -440,6 +455,26 @@ public:
             return SendResult::invalid;
         }
 
+        // ★ 先解析目标并确认端点仍在，再取序号：
+        //   否则"参数非法/已关闭"的发送也会消耗序号，对端看到空洞。
+        netmech::Address dst;
+        if (dst_override.has_value()) {
+            dst = detail::to_address(*dst_override);
+        } else if (cfg_.remote.has_value()) {
+            dst = detail::to_address(*cfg_.remote);
+        }
+        if (dst.port() == 0) {
+            return SendResult::invalid;   // 既没配 remote 也没给 dst
+        }
+        if (!rtp_ep_) {
+            return SendResult::closed;
+        }
+
+        // 显式时间戳也要推进内部游标：否则之后切回 send() 会拿到旧值。
+        if (ts_override.has_value()) {
+            advance_ts_from(*ts_override);
+        }
+
         RtpPacketInfo info;
         info.payload_type = cfg_.payload_type;
         info.marker       = marker;
@@ -457,20 +492,6 @@ public:
             bec);
         if (bec || written == 0) {
             return SendResult::invalid;
-        }
-
-        netmech::Address dst;
-        if (dst_override.has_value()) {
-            dst = detail::to_address(*dst_override);
-        } else if (cfg_.remote.has_value()) {
-            dst = detail::to_address(*cfg_.remote);
-        }
-        if (dst.port() == 0) {
-            return SendResult::invalid;   // 既没配 remote 也没给 dst
-        }
-
-        if (!rtp_ep_) {
-            return SendResult::closed;
         }
         if (!rtp_ep_->send_to(dst, netmech::ConstBuf{wire, wire->data(), written})) {
             return SendResult::closed;
@@ -528,6 +549,9 @@ public:
         const std::uint32_t ssrc = ssrc_.load(std::memory_order_acquire);
         // ★ 整帧只取一次时间戳：所有分片共用（RFC 3550 / RFC 6184）。
         const std::uint32_t ts = ts_override.has_value() ? *ts_override : next_timestamp();
+        if (ts_override.has_value()) {
+            advance_ts_from(ts);   // 与 send_with_timestamp 保持同一游标语义
+        }
         const netmech::Address dst = detail::to_address(*cfg_.remote);
 
         bool        failed = false;
@@ -828,6 +852,8 @@ public:
         st.parse_errors   = parse_errors_.load(std::memory_order_relaxed);
         st.rtcp_send_failures    = rtcp_send_failures_.load(std::memory_order_relaxed);
         st.self_loopback_ignored = self_loopback_ignored_.load(std::memory_order_relaxed);
+        st.ssrc_collisions       = ssrc_collisions_.load(std::memory_order_relaxed);
+        st.rtcp_without_cname    = rtcp_without_cname_.load(std::memory_order_relaxed);
         // ★ 只读原子镜像，不碰 tracker_（std::map，只在 io 线程上访问）。
         //   以前这里直接 `tracker_.size()` / `rtt_us()` —— 与收包路径插树并发，
         //   是无同步读 map，属于 UB。测试没发现是因为都在流量停止后才查。
@@ -1000,20 +1026,19 @@ private:
         }
         last_collision_from_ = key;
 
-        const std::uint32_t old_ssrc = cur_ssrc;
         // 已经用这个 SSRC 发过数据 → 先发 BYE 告知对端
         if (rtp_sent_.load(std::memory_order_relaxed) > 0) {
             send_bye({});
         }
         const std::uint32_t new_ssrc = gen_random32();
         ssrc_.store(new_ssrc, std::memory_order_release);
+        ssrc_collisions_.fetch_add(1, std::memory_order_relaxed);
         // ★ tracker 里的 local_ssrc 也要跟着换：它用这个值把"自己发的包"和
         //   "报告我的 RR 块"挑出来。不同步的话，换号之后 RTT 匹配就断了，
         //   而且对端报告块里针对旧号的条目会被当成别的源。
         tracker_.set_local_ssrc(new_ssrc);
-
-        std::printf("[rtpmech] SSRC collision from %s: %08X -> %08X\n",
-                    from.to_string().c_str(), old_ssrc, new_ssrc);
+        // 库内不再打印日志：换号已通过 stats().ssrc_collisions 暴露，
+        // 需要细节的调用方可以在自己的日志里对比 local_ssrc() 变化。
     }
 
     // ---- 最近发出的 RTP 序号（识别"自己发包的回环"）----
@@ -1040,6 +1065,15 @@ private:
             }
         }
         return false;
+    }
+
+    /// 显式指定时间戳发送后，把内部游标推进到"这一帧之后"。
+    /// 否则下一次不传时间戳的 send() 会复用很久以前的 ts_current_。
+    void advance_ts_from(std::uint32_t ts) noexcept
+    {
+        if (ts_increment_ != 0) {
+            ts_current_ = ts + ts_increment_;
+        }
     }
 
     std::uint32_t next_timestamp()
@@ -1115,6 +1149,8 @@ private:
     std::atomic<std::uint64_t> octet_sent_{0};
     std::atomic<std::uint64_t> rtcp_send_failures_{0};
     std::atomic<std::uint64_t> self_loopback_ignored_{0};
+    std::atomic<std::uint64_t> ssrc_collisions_{0};
+    std::atomic<std::uint64_t> rtcp_without_cname_{0};
 
     // ---- 对外统计的原子镜像（见 sync_tracker_stats） ----
     //   tracker_ 只能在 io 线程碰；stats() 从任意线程调，所以这两个数单独存。
