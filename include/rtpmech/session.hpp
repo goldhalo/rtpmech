@@ -24,10 +24,12 @@
 
 #include <rtpmech/buffer.hpp>
 #include <rtpmech/endpoint.hpp>
+#include <rtpmech/span.hpp>
 
 namespace rtpmech {
 
 class RtpPacket;              // 只读包视图（现有类型，接口不变）
+class Packetizer;             // 载荷分片器（send_frame 用）
 class RtcpCompoundPacket;     // RTCP 复合包视图（现有类型）
 class RtpSession;             // 回调里以引用形式传出，见 RtpHandler
 
@@ -221,6 +223,13 @@ struct RtpSessionStats {
     std::uint64_t send_rejected = 0;   ///< 被反压 / 已关闭 拒绝的发送次数
     std::uint64_t parse_errors  = 0;   ///< 非法包（不影响会话存活）
 
+    /// RTCP 复合包**未能发出**的次数（无 remote / 缓冲不足 / 已关闭）。
+    /// 正常情况下应为 0；持续增长说明 RTCP 配置或网络有问题。
+    std::uint64_t rtcp_send_failures = 0;
+    /// 收到「自己发出的包」的回环（组播 loopback / 发给自己）次数。
+    /// 这些包会被识别并忽略：不算 SSRC 冲突、不回调 on_packet。
+    std::uint64_t self_loopback_ignored = 0;
+
     std::size_t   active_sources = 0;  ///< 当前跟踪的远端源数量
     std::optional<std::uint32_t> rtt_us; ///< 最近一次测得的 RTT（微秒）
 };
@@ -327,6 +336,32 @@ public:
     /// 发到显式目标（覆盖配置里的 remote）。
     SendResult send_to(const Endpoint& dst,
                        ConstBuf payload, bool marker);
+
+    /// 发**一整帧** ES：由库负责「整帧一个时间戳 + 分片 + 序号」。
+    ///
+    /// 与 `send()`（一次调用 = 一个 RTP 包，时间戳每次前进一个增量）不同：
+    /// 本接口把整帧交给 `Packetizer` 分片，**所有分片共用同一个 RTP 时间戳**，
+    /// marker 只在最后一个包为 true。这是 RFC 3550 / 6184 要求的正确用法：
+    /// 以前 README 教「packetizer 每个分片回调里调一次 send()」，时间戳会逐分片
+    /// 前进，接收端把一帧拆成多个采样时刻 —— 播放端会跳/加速。
+    ///
+    /// @param[in] frame      一帧 ES（H.26x 为 AnnexB；其他格式由 Packetizer 定义）
+    /// @param[in] packetizer 分片器。`on_frame` 在**会话的 io 线程**上执行：
+    ///                       同一实例不能在多线程/多会话并发使用。
+    /// @return `accepted` 表示整帧已受理（分片过程中发送失败会体现在
+    ///         `stats().send_rejected` 上）；`closed` / `invalid` 为同步判定。
+    ///
+    /// @note frame 内容会被**复制**（异步投递），调用方返回后即可复用缓冲。
+    /// @note 帧级 API 只发到配置的 `remote`（没有 send_to 变体）。
+    /// @warning `packetizer` 必须比这次发送**活得更久**：投递到 io 线程的任务
+    ///          只持有它的指针（分片在 io 线程上执行）。通常把它做成会话持有
+    ///          的成员，不要用临时对象。
+    SendResult send_frame(span<const std::uint8_t> frame, Packetizer& packetizer);
+
+    /// 同 `send_frame`，但显式指定本帧时间戳（对应 `send_with_timestamp`）。
+    SendResult send_frame_with_timestamp(span<const std::uint8_t> frame,
+                                         Packetizer& packetizer,
+                                         std::uint32_t timestamp);
 
     /// 立即发一个 RTCP 复合包（不等定时器）。
     ///

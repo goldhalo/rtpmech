@@ -10,6 +10,7 @@
 //    * 活跃时析构不崩
 // ============================================================================
 #include <rtpmech/rtpmech.hpp>
+#include <rtpmech/h264.hpp>
 
 #include <netmech/net.hpp>
 
@@ -688,4 +689,113 @@ NETMECH_TEST(session_rtt_measured_between_two_senders)
 
     a->close();
     b->close();
+}
+
+// ---------------------------------------------------------------------------
+// 15. 帧级 API：一整帧的所有分片必须共用同一个 RTP 时间戳
+//
+//     以前 README 教"packetizer 每个分片回调里调一次 send()"，时间戳会逐分片
+//     前进 3600 —— 接收端把一帧当成多个采样时刻。
+// ---------------------------------------------------------------------------
+NETMECH_TEST(session_send_frame_shares_timestamp)
+{
+    std::error_code ec;
+
+    auto collector = std::make_shared<Collector>();
+    auto rx = RtpSession::create(base_cfg(), collector, ec);
+    REQUIRE(!ec);
+
+    auto cfg = base_cfg();
+    cfg.remote = Endpoint("127.0.0.1", rx->local_rtp_port());
+    auto tx = RtpSession::create(cfg, std::make_shared<NullHandler>(), ec);
+    REQUIRE(!ec);
+
+    // 一帧 = AUD + 一个 > MTU 的 IDR（必然 FU-A 成多包）
+    std::vector<std::uint8_t> frame;
+    const std::uint8_t aud[] = {0x00, 0x00, 0x00, 0x01, 0x09, 0xF0};
+    const std::uint8_t idr[] = {0x00, 0x00, 0x00, 0x01, 0x65};
+    frame.insert(frame.end(), aud, aud + sizeof aud);
+    frame.insert(frame.end(), idr, idr + sizeof idr);
+    frame.resize(frame.size() + 3000, 0x5A);
+
+    H264Packetizer pkt;
+    CHECK_EQ(tx->send_frame(span<const std::uint8_t>(frame.data(), frame.size()), pkt),
+             SendResult::accepted);
+
+    REQUIRE(wait_for([&] { return collector->count.load() >= 3; }));
+
+    std::lock_guard<std::mutex> lk(collector->mtx);
+    REQUIRE(collector->timestamps.size() >= 3u);
+
+    // 所有分片时间戳相同
+    for (std::size_t i = 0; i < collector->timestamps.size(); ++i) {
+        CHECK_EQ(collector->timestamps[i], collector->timestamps[0]);
+    }
+    // 序号连续
+    for (std::size_t i = 1; i < collector->seqs.size(); ++i) {
+        CHECK_EQ(collector->seqs[i],
+                 static_cast<std::uint16_t>(collector->seqs[i - 1] + 1));
+    }
+
+    tx->close();
+    rx->close();
+}
+
+// ---------------------------------------------------------------------------
+// 16. 自回环不能被误判成 SSRC 冲突
+//
+//     组播 loopback / "发给自己" 都会收到 SSRC 与本地相同的包。以前只看
+//     SSRC 相同就判冲突 → 发 BYE + 换号，接着自己的下一包再触发……
+// ---------------------------------------------------------------------------
+NETMECH_TEST(session_ignores_self_loopback)
+{
+    std::error_code ec;
+    const auto base = netmech::find_free_port_run(42000, 45000, 2, 2);
+    REQUIRE(base.has_value());
+
+    RtpSessionConfig cfg = base_cfg();
+    cfg.local          = Endpoint("127.0.0.1", static_cast<std::uint16_t>(*base));
+    cfg.remote         = Endpoint("127.0.0.1", static_cast<std::uint16_t>(*base));
+    cfg.enable_rtcp    = false;
+    cfg.rtp_port_end   = 0;
+
+    auto sess = RtpSession::create(cfg, std::make_shared<NullHandler>(), ec);
+    REQUIRE(!ec);
+    const std::uint32_t ssrc0 = sess->local_ssrc();
+
+    const std::uint8_t payload[8] = {1, 2, 3, 4, 5, 6, 7, 8};
+    for (int i = 0; i < 5; ++i) {
+        CHECK_EQ(sess->send(ConstBuf{nullptr, payload, sizeof payload}, false),
+                 SendResult::accepted);
+    }
+
+    REQUIRE(wait_for([&] { return sess->stats().self_loopback_ignored >= 5u; }));
+    CHECK_EQ(sess->local_ssrc(), ssrc0);   // 不应因自回环换号
+    CHECK_EQ(sess->stats().rtp_received, std::uint64_t{0});   // 自己包不回调
+
+    sess->close();
+}
+
+// ---------------------------------------------------------------------------
+// 17. 没有 remote 时，RTCP 定时器不能 1ms 忙循环
+//
+//     以前 send_rtcp 失败路径不推进调度，定时器按 1ms 重排：
+//     每秒上千次唤醒去尝试一个注定失败的发送。
+// ---------------------------------------------------------------------------
+NETMECH_TEST(session_rtcp_without_remote_does_not_spin)
+{
+    std::error_code ec;
+    auto cfg = base_cfg();
+    cfg.enable_rtcp = true;   // 开了 RTCP，但没有 remote
+
+    auto sess = RtpSession::create(cfg, std::make_shared<NullHandler>(), ec);
+    REQUIRE(!ec);
+
+    std::this_thread::sleep_for(std::chrono::milliseconds(250));
+
+    const auto st = sess->stats();
+    CHECK_EQ(st.rtcp_sent, std::uint64_t{0});
+    CHECK(st.rtcp_send_failures <= 2u);   // 忙循环时 250ms 会有上百次
+
+    sess->close();
 }

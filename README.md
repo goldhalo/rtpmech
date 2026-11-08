@@ -133,17 +133,22 @@ void on_packet(RtpSession&, const RtpPacket& pkt, const Address& from) override
 ## 载荷分片（H.264 / H.265）
 
 `RtpSession::send()` 的契约始终是**一个 send = 一个 RTP 包**。要按标准把一帧切成
-多个包，用 `Packetizer`：
+多个包，用 `Packetizer` **配合 `send_frame()`**：
 
 ```cpp
 #include <rtpmech/rtpmech.hpp>
 
 H264Packetizer pkt;      // 或 H265Packetizer（RFC 7798，格式不同）
 
-pkt.on_frame(frame, [&](span<const std::uint8_t> payload, bool marker) {
-    sess.send({nullptr, payload.data(), payload.size()}, marker);
-});
+// ★ 整帧一次交给库：所有分片共用同一个 RTP 时间戳、序号由库递增、
+//   marker 只在最后一个包为 true（RFC 3550 / 6184 的要求）。
+sess.send_frame(frame, pkt);
 ```
+
+> **不要**在 `packetizer.on_frame` 的回调里逐分片调 `send()`：`send()` 每调用
+> 一次时间戳就前进一个 `timestamp_increment`，同一帧的多个分片会拿到不同的
+> 时间戳 —— 接收端会把一帧当成多个采样时刻，播放端跳变/加速。
+> 需要自己控制时间戳时用 `send_frame_with_timestamp()`。
 
 | 分片器 | 标准 | 支持 |
 |---|---|---|

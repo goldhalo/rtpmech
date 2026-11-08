@@ -203,8 +203,11 @@ void SourceTracker::on_rtp_received(const RtpPacket& pkt,
             const std::int64_t d = arrival_delta_ts - ts_delta;
             const std::int64_t abs_d = d < 0 ? -d : d;
 
-            // J += (|D| - J) / 16
-            st.jitter_units += (abs_d - st.jitter_units) / 16;
+            // J += (|D| - J) / 16，而 jitter_units 存的是 16·J：
+            //     16·J_new = 16·J + (|D| - J)
+            // 所以 |D| 必须乘 16 再减。以前漏了乘 16，上报值只有正确值的
+            // 1/16（实测恒定 |D|=900 tick 时 jitter()=55，RFC 应为 900）。
+            st.jitter_units += (abs_d * 16 - st.jitter_units) / 16;
         }
     }
 

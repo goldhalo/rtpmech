@@ -19,10 +19,12 @@
 #include "rtpmech/session.hpp"
 
 #include <atomic>
+#include <array>
 #include <rtpmech/rtcp_packet.hpp>
 #include <rtpmech/rtp_packet.hpp>
 
 #include <netmech/net.hpp>
+#include <rtpmech/packetizer.hpp>
 
 #include "rtcp_scheduler.hpp"
 #include "source_tracker.hpp"
@@ -239,7 +241,10 @@ public:
         first_send_time_ = steady_clock_t::now();
         open_.store(true, std::memory_order_release);
 
-        if (cfg_.enable_rtcp) {
+        // 没有 remote 时排定时器只会「每秒上千次尝试发送并失败」（见 rtcp_failed）。
+        // 帧级/包级发送都可以不配 remote（用 send_to），但 RTCP 没有显式目标，
+        // 因此只在有 remote 时启动自动调度。
+        if (cfg_.enable_rtcp && cfg_.remote.has_value()) {
             schedule_rtcp();
         }
         return {};
@@ -263,8 +268,18 @@ public:
             return;
         }
 
-        // SSRC 冲突（RFC 3550 §8.2）：收到的包 SSRC 与自己相同但来源不同。
+        // SSRC 相同的包有两种可能：
+        //   (a) 自己发出的包被回环回来（组播 loopback / 自己发给自己）—— 忽略；
+        //   (b) 真的 SSRC 冲突（RFC 3550 §8.2）—— 换号。
+        //
+        // 判据用「序号是否落在最近发出的窗口内」，而不是比来源地址：组播回环
+        // 的源地址是本机某张网卡的 IP，与 bind 的 0.0.0.0 永远对不上。
+        // 以前没有这个判断，组播发送端会把自己的包当成冲突，SSRC 每包一换。
         if (pkt->ssrc() == ssrc_.load(std::memory_order_acquire)) {
+            if (is_self_loopback_seq(pkt->sequence())) {
+                self_loopback_ignored_.fetch_add(1, std::memory_order_relaxed);
+                return;
+            }
             on_ssrc_collision(from);
             return;
         }
@@ -461,14 +476,115 @@ public:
             return SendResult::closed;
         }
 
+        note_sent_seq(info.sequence);
         rtp_sent_.fetch_add(1, std::memory_order_relaxed);
         octet_sent_.fetch_add(payload.size, std::memory_order_relaxed);
         return SendResult::accepted;
     }
 
     // -------------------------------------------------------------------------
+    //  帧级发送（整帧一个时间戳）
+    // -------------------------------------------------------------------------
+
+    /// 同步校验 + 投递到 io 线程。frame 已由门面复制进 shared_ptr。
+    SendResult post_send_frame(std::shared_ptr<std::vector<std::uint8_t>> frame,
+                               Packetizer* packetizer,
+                               std::optional<std::uint32_t> ts_override)
+    {
+        if (!open_.load(std::memory_order_acquire)) {
+            return SendResult::closed;
+        }
+        if (!packetizer || !frame || frame->empty()) {
+            return SendResult::invalid;
+        }
+        if (!cfg_.remote.has_value() || cfg_.remote->port() == 0) {
+            return SendResult::invalid;   // 帧级 API 只发 remote
+        }
+
+        auto self = weak_from_this().lock();
+        if (!self) {
+            return SendResult::closed;
+        }
+        auto fn = [self, frame = std::move(frame), packetizer, ts_override]() mutable {
+            (void)self->send_frame_now(
+                span<const std::uint8_t>(frame->data(), frame->size()),
+                *packetizer, ts_override);
+        };
+        if (post_) {
+            post_(std::move(fn), /*allow_inline=*/true);
+        } else {
+            fn();
+        }
+        return SendResult::accepted;
+    }
+
+    /// io 线程上执行：取**一次**时间戳，所有分片共用。
+    SendResult send_frame_now(span<const std::uint8_t> frame, Packetizer& packetizer,
+                              std::optional<std::uint32_t> ts_override)
+    {
+        if (!open_.load(std::memory_order_acquire) || !rtp_ep_) {
+            return SendResult::closed;
+        }
+        const std::uint32_t ssrc = ssrc_.load(std::memory_order_acquire);
+        // ★ 整帧只取一次时间戳：所有分片共用（RFC 3550 / RFC 6184）。
+        const std::uint32_t ts = ts_override.has_value() ? *ts_override : next_timestamp();
+        const netmech::Address dst = detail::to_address(*cfg_.remote);
+
+        bool        failed = false;
+        std::size_t octets = 0;
+
+        packetizer.on_frame(frame, [&](span<const std::uint8_t> payload, bool marker) {
+            if (failed || payload.empty()) {
+                return;
+            }
+            if (payload.size() + kRtpFixedHeaderSize > cfg_.max_packet_size) {
+                failed = true;   // 分片器与 session 的 MTU 配置不一致
+                return;
+            }
+            RtpPacketInfo info;
+            info.payload_type = cfg_.payload_type;
+            info.marker       = marker;
+            info.sequence     = seq_.fetch_add(1, std::memory_order_relaxed);
+            info.ssrc         = ssrc;
+            info.timestamp    = ts;
+
+            auto wire = std::make_shared<std::vector<std::uint8_t>>(
+                kRtpFixedHeaderSize + payload.size());
+            std::error_code bec;
+            const std::size_t written =
+                build_rtp_packet(wire->data(), wire->size(), info, payload, bec);
+            if (bec || written == 0 ||
+                !rtp_ep_->send_to(dst, netmech::ConstBuf{wire, wire->data(), written})) {
+                failed = true;
+                return;
+            }
+            note_sent_seq(info.sequence);
+            rtp_sent_.fetch_add(1, std::memory_order_relaxed);
+            octets += payload.size();
+        });
+
+        octet_sent_.fetch_add(octets, std::memory_order_relaxed);
+        if (failed) {
+            send_rejected_.fetch_add(1, std::memory_order_relaxed);
+            return SendResult::closed;
+        }
+        return SendResult::accepted;
+    }
+
+    // -------------------------------------------------------------------------
     //  RTCP
     // -------------------------------------------------------------------------
+
+    /// RTCP 发送失败：计一次失败并**推进调度**。
+    ///
+    /// 不推进的话 `next_send_sec_` 停在过去，`schedule_rtcp()` 会按 1ms 重排，
+    /// 变成每秒上千次无效唤醒 —— 无 `remote` / `max_packet_size` 配小时必现。
+    bool rtcp_failed() noexcept
+    {
+        rtcp_send_failures_.fetch_add(1, std::memory_order_relaxed);
+        scheduler_.on_rtcp_sent(0, steady_now_sec());
+        return false;
+    }
 
     bool send_rtcp(bool force)
     {
@@ -526,7 +642,7 @@ public:
 
             const std::size_t n = build_rtcp_sender_report(buf.data(), buf.size(), sr, ec);
             if (ec) {
-                return false;
+                return rtcp_failed();
             }
             off += n;
         } else {
@@ -537,7 +653,7 @@ public:
             const std::size_t n =
                 build_rtcp_receiver_report(buf.data(), buf.size(), rr, ec);
             if (ec) {
-                return false;
+                return rtcp_failed();
             }
             off += n;
         }
@@ -553,12 +669,12 @@ public:
         const std::size_t n_sdes =
             build_rtcp_sdes(buf.data() + off, buf.size() - off, sdes, ec);
         if (ec) {
-            return false;
+            return rtcp_failed();
         }
         off += n_sdes;
 
         if (!send_on_rtcp(buf, off)) {
-            return false;
+            return rtcp_failed();
         }
 
         // ★ 记下"我刚发过 SR"，供对端 RR 里的 lsr 匹配后算 RTT。
@@ -710,6 +826,8 @@ public:
         st.rtcp_received  = rtcp_received_.load(std::memory_order_relaxed);
         st.send_rejected  = send_rejected_.load(std::memory_order_relaxed);
         st.parse_errors   = parse_errors_.load(std::memory_order_relaxed);
+        st.rtcp_send_failures    = rtcp_send_failures_.load(std::memory_order_relaxed);
+        st.self_loopback_ignored = self_loopback_ignored_.load(std::memory_order_relaxed);
         // ★ 只读原子镜像，不碰 tracker_（std::map，只在 io 线程上访问）。
         //   以前这里直接 `tracker_.size()` / `rtt_us()` —— 与收包路径插树并发，
         //   是无同步读 map，属于 UB。测试没发现是因为都在流量停止后才查。
@@ -898,6 +1016,32 @@ private:
                     from.to_string().c_str(), old_ssrc, new_ssrc);
     }
 
+    // ---- 最近发出的 RTP 序号（识别"自己发包的回环"）----
+    // 只在一个 io 线程上访问：发送与收包回调同在 RTP 端点的 io 线程。
+    static constexpr std::size_t kRecentSeqRing = 128;
+    std::array<std::uint16_t, kRecentSeqRing> recent_seq_{};
+    std::size_t recent_seq_pos_   = 0;
+    std::size_t recent_seq_count_ = 0;
+
+    void note_sent_seq(std::uint16_t s) noexcept
+    {
+        recent_seq_[recent_seq_pos_] = s;
+        recent_seq_pos_ = (recent_seq_pos_ + 1) % kRecentSeqRing;
+        if (recent_seq_count_ < kRecentSeqRing) {
+            ++recent_seq_count_;
+        }
+    }
+
+    [[nodiscard]] bool is_self_loopback_seq(std::uint16_t seq) const noexcept
+    {
+        for (std::size_t i = 0; i < recent_seq_count_; ++i) {
+            if (recent_seq_[i] == seq) {
+                return true;
+            }
+        }
+        return false;
+    }
+
     std::uint32_t next_timestamp()
     {
         if (ts_increment_ != 0) {
@@ -969,6 +1113,8 @@ private:
     std::atomic<std::uint64_t> send_rejected_{0};
     std::atomic<std::uint64_t> parse_errors_{0};
     std::atomic<std::uint64_t> octet_sent_{0};
+    std::atomic<std::uint64_t> rtcp_send_failures_{0};
+    std::atomic<std::uint64_t> self_loopback_ignored_{0};
 
     // ---- 对外统计的原子镜像（见 sync_tracker_stats） ----
     //   tracker_ 只能在 io 线程碰；stats() 从任意线程调，所以这两个数单独存。
@@ -1051,6 +1197,33 @@ SendResult RtpSession::send_to(const Endpoint& dst, ConstBuf payload, bool marke
         return SendResult::closed;
     }
     return impl_->post_send(payload, marker, std::nullopt, dst);
+}
+
+SendResult RtpSession::send_frame(span<const std::uint8_t> frame,
+                                  Packetizer& packetizer)
+{
+    if (!impl_) {
+        return SendResult::closed;
+    }
+    if (frame.empty()) {
+        return SendResult::invalid;
+    }
+    auto data = std::make_shared<std::vector<std::uint8_t>>(frame.begin(), frame.end());
+    return impl_->post_send_frame(std::move(data), &packetizer, std::nullopt);
+}
+
+SendResult RtpSession::send_frame_with_timestamp(span<const std::uint8_t> frame,
+                                                 Packetizer& packetizer,
+                                                 std::uint32_t timestamp)
+{
+    if (!impl_) {
+        return SendResult::closed;
+    }
+    if (frame.empty()) {
+        return SendResult::invalid;
+    }
+    auto data = std::make_shared<std::vector<std::uint8_t>>(frame.begin(), frame.end());
+    return impl_->post_send_frame(std::move(data), &packetizer, timestamp);
 }
 
 bool RtpSession::send_rtcp_now()

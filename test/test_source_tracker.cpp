@@ -273,3 +273,29 @@ NETMECH_TEST(tracker_sender_count)
     CHECK_EQ(tr.sender_count(), std::size_t{2});
     CHECK_EQ(tr.size(), std::size_t{2});
 }
+
+// ---------------------------------------------------------------------------
+// N. 抖动公式（RFC 3550 A.8）：恒定 |D| 应收敛到 |D|，不是 |D|/16
+//
+//    以前 jitter_units（存 16·J）的更新写成 (abs_d - jitter_units)/16，
+//    等于把 |D| 也除了 16 —— 上报值只有正确值的 1/16。
+//    450 个包、恒定 |D|=900 tick 时，RFC 期望 jitter() ≈ 900。
+// ---------------------------------------------------------------------------
+NETMECH_TEST(tracker_jitter_matches_rfc)
+{
+    SourceTracker tr(/*local_ssrc=*/1, /*clock_rate=*/90000);
+
+    std::int64_t  arrival = 0;
+    std::uint32_t ts      = 0;
+    for (int i = 0; i < 450; ++i) {
+        OwnedPacket o(2, static_cast<std::uint16_t>(i), ts);
+        tr.on_rtp_received(o.get(), arrival);
+        arrival += 110000;   // 到达间隔 110 ms
+        ts      += 9000;     // 发送间隔 100 ms ⇒ |D| = 900 tick
+    }
+
+    const SourceStats* st = tr.find(2);
+    REQUIRE(st != nullptr);
+    CHECK(st->jitter() >= 880u);
+    CHECK(st->jitter() <= 920u);
+}
