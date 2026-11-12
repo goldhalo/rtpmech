@@ -169,8 +169,10 @@ public:
                 //   端点，它们与最终端点共用同一个 Impl；netmech 外部线程
                 //   close() 最多等 500ms，io 线程阻塞时 on_close 会迟到 ——
                 //   不校验身份的话，迟到的回调会误杀刚建好的健康会话。
-                //   on_close 在 io 线程上执行，读 rtp_ep_ 安全。
-                if (self->is_open() && &ep == self->rtp_ep_.get()) {
+                //   身份走原子镜像 rtp_ep_id_（rtp_ep_ 在端口搜索阶段
+                //   由用户线程写，io 线程直接读会竞争）。
+                if (self->is_open() &&
+                    &ep == self->rtp_ep_id_.load(std::memory_order_acquire)) {
                     Impl::request_close(self, ec);
                 }
             }
@@ -866,6 +868,7 @@ public:
         if (rtp_ep_) {
             rtp_ep_->close();
             rtp_ep_.reset();
+            rtp_ep_id_.store(nullptr, std::memory_order_release);
         }
 
         if (handler_) {
@@ -905,11 +908,14 @@ public:
         }
         // 探测是否在本端点的 io 线程上：是则**不能等**（会死锁）。
         // 同线程串行保证析构与回调不并发，且 do_close 不读 facade_，安全。
-        // ★ 标志用 shared_ptr：用户线程上探测任务会排队到 do_close 之后
-        //   才执行，那时 wait_closed 早已返回——抓栈引用会写已释放的栈帧。
-        auto on_io = std::make_shared<bool>(false);
-        post_([on_io] { *on_io = true; }, /*allow_inline=*/true);
-        if (*on_io) {
+        // ★ 标志用 shared_ptr<atomic<bool>>：用户线程上探测任务会排队到
+        //   do_close 之后才执行，那时 wait_closed 早已返回——抓栈引用会写
+        //   已释放的栈帧；而普通 bool 的"主线程读 / io 线程写"是数据竞争
+        //   （TSan 会抓），必须原子。排队场景下的迟写无害。
+        auto on_io = std::make_shared<std::atomic<bool>>(false);
+        post_([on_io] { on_io->store(true, std::memory_order_relaxed); },
+              /*allow_inline=*/true);
+        if (on_io->load(std::memory_order_relaxed)) {
             return;
         }
         // 用户线程：等 do_close 完成。超时兜底：io 线程卡死时不让析构永久悬挂。
@@ -1085,6 +1091,10 @@ private:
             return false;
         }
         rtp_port_ = rtp_ep_->local_address().port();
+        // ★ 端点身份用原子指针另存：on_close（io 线程）要拿它校验身份，
+        //   而 rtp_ep_ 本身在端口搜索阶段由用户线程写——直接读 shared_ptr
+        //   会与之竞争。这里只存裸指针值供比较，不解引用。
+        rtp_ep_id_.store(rtp_ep_.get(), std::memory_order_release);
         return true;
     }
 
@@ -1237,6 +1247,10 @@ private:
     //   ⚠ 加新的公开方法时，记得先 post_；直接碰上面这些成员就是数据竞争。
     std::function<void(std::function<void()>, bool)> post_;
     std::shared_ptr<netmech::UdpEndpoint> rtp_ep_;
+    /// RTP 端点身份（裸指针值，仅供 on_close 比较，不解引用）。
+    /// rtp_ep_ 在端口搜索阶段由用户线程写，on_close 在 io 线程读，
+    /// 跨线程访问必须走这个原子镜像。
+    std::atomic<netmech::UdpEndpoint*> rtp_ep_id_{nullptr};
     std::shared_ptr<netmech::UdpEndpoint> rtcp_ep_;
     std::shared_ptr<RtpHandler>           handler_;
 
