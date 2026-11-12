@@ -37,14 +37,28 @@ RtcpScheduler::RtcpScheduler(RtcpSchedulerParams params) noexcept
 void RtcpScheduler::update_members(std::size_t members,
                                    std::size_t senders) noexcept
 {
-    members_ = members == 0 ? 1 : members;
+    const std::size_t new_members = members == 0 ? 1 : members;
+    const bool shrunk = new_members < members_;
+    members_ = new_members;
     senders_ = std::min(senders, members_);
+
+    // ★ RFC 3550 A.7 reverse reconsideration：成员数下降（大批 BYE）后
+    //   间隔应随之缩短。以前只存数值不重排，最多滞后一个完整间隔
+    //   才恢复响应。新基准比已排的下一拍更早就提前（只提前不推后）。
+    if (shrunk) {
+        const double t = deterministic_interval();
+        const double candidate = last_now_sec_ + t;
+        if (candidate < next_send_sec_) {
+            next_send_sec_ = candidate;
+        }
+    }
 }
 
 void RtcpScheduler::reset(double now_sec) noexcept
 {
     avg_packet_size_ = static_cast<double>(params_.initial_avg_packet_size);
     first_send_      = true;
+    last_now_sec_    = now_sec;
     next_send_sec_   = now_sec;   // 首次可立即发送
 }
 
@@ -67,26 +81,37 @@ double RtcpScheduler::deterministic_interval() const noexcept
 
     // ---- 2. 按发送者/接收者划分带宽（RFC 3550 §6.2）----
     //
-    //   RFC 3550 原文（§6.2, "Determining the RTCP Reporting Interval"）:
+    //   发送者占参与者比例 <= 25% 时：
+    //       发送者共享 RTCP 带宽的 25%，接收者共享 75%；
+    //       T_sender   = avg × senders   / (0.25 × rtcp_bw)
+    //       T_receiver = avg × receivers / (0.75 × rtcp_bw)
+    //   发送者占比 > 25% 时：全体共同分摊 rtcp_bw。
+    //   没有发送者时：接收者使用全部 RTCP 带宽。
     //
-    //     若发送者占参与者比例 <= 25%：
-    //         发送者共享 RTCP 带宽的 25%，接收者共享 75%
-    //     若发送者占比 > 25%：
-    //         发送者共享 25%，接收者共享 75% —— 但接收者数量少时，
-    //         其人均带宽随之提高；
-    //         若接收者数量为 0，则发送者获得全部 RTCP 带宽。
-    //
-    //   本函数返回的是**全体参与者**的平均间隔基准。由于本库的
-    //   RtcpScheduler 面向单一会话（本端 + 其他参与者），采用 RFC 的
-    //   简化形式：按"本端角色"取对应份额的倒数作为缩放因子。
-    //
-    //   为了保持接口简单且行为可预测，这里按 RFC 的**保守**做法：
-    //   使用 rtcp_bw 的整体作为带宽基准（即所有参与者共同分摊），
-    //   这在 n 较小时略偏保守（RTCP 发送略少），不会超过 5% 上限。
+    //   以前对全体一律用 t = avg×n/rtcp_bw，注释自称"保守"是错的：
+    //   1 发送者 + 99 接收者时发送者应享 25% 带宽，旧实现给出 1/100
+    //   → SR 慢 25 倍，直接拖慢 RTT 测量与唇音同步。
     const double n = static_cast<double>(members_ < 1 ? 1 : members_);
+    const double s = static_cast<double>(senders_);
 
-    // ---- 3. 基础间隔 T = avg_size × n / bandwidth ----
-    double t = (avg_packet_size_ * n) / rtcp_bw;
+    // ---- 3. 基础间隔 T = avg_size × 角色对应人数 / 角色带宽 ----
+    double t;
+    if (s <= 0.0) {
+        // 无发送者：接收者独占全部 RTCP 带宽
+        t = (avg_packet_size_ * n) / rtcp_bw;
+    } else if (s <= n * params_.sender_bandwidth_fraction) {
+        if (local_is_sender_) {
+            t = (avg_packet_size_ * s) /
+                (rtcp_bw * params_.sender_bandwidth_fraction);
+        } else {
+            const double receivers = n - s;
+            t = (avg_packet_size_ * (receivers > 0.0 ? receivers : 1.0)) /
+                (rtcp_bw * (1.0 - params_.sender_bandwidth_fraction));
+        }
+    } else {
+        // 发送者超过 25%：全体共同分摊
+        t = (avg_packet_size_ * n) / rtcp_bw;
+    }
 
     // ---- 4. 最小间隔限制（RFC 3550：T ≥ 5 秒）----
     //
@@ -134,6 +159,7 @@ void RtcpScheduler::on_rtcp_sent(std::size_t packet_size, double now_sec) noexce
     const double size = static_cast<double>(packet_size);
     avg_packet_size_ = avg_packet_size_ * (15.0 / 16.0) + size * (1.0 / 16.0);
 
+    last_now_sec_ = now_sec;
     schedule_next(now_sec);
 }
 

@@ -299,3 +299,95 @@ NETMECH_TEST(tracker_jitter_matches_rfc)
     CHECK(st->jitter() >= 880u);
     CHECK(st->jitter() <= 920u);
 }
+
+// ---------------------------------------------------------------------------
+// N+1. fraction lost 是**区间**值（RFC 3550 A.3）：丢包突发后链路恢复
+//      干净，下一份报告的 fraction 应回到 0。
+//      以前 expected_prior/received_prior 从未被写入，fraction 退化成
+//      累计值，早期丢包后永远居高不下。
+// ---------------------------------------------------------------------------
+NETMECH_TEST(tracker_fraction_lost_is_interval_based)
+{
+    SourceTracker tr(0, 90000);
+    // 区间 1：seq 0..9 缺 5 → expected=10, received=9, fraction=(1<<8)/10=25
+    for (std::uint16_t i = 0; i < 10; ++i) {
+        if (i == 5) { continue; }
+        OwnedPacket o(0x1234, i, i * 3000);
+        tr.on_rtp_received(o.get(), static_cast<std::int64_t>(i) * 33000);
+    }
+    const SourceStats* st = tr.find(0x1234);
+    REQUIRE(st != nullptr);
+    CHECK_EQ(st->fraction_lost(), std::uint8_t{25});
+
+    // 报告发出 → 采样区间基线
+    const auto blocks = tr.build_report_blocks();
+    REQUIRE(blocks.size() == std::size_t{1});
+    tr.commit_report_sampling(blocks);
+
+    // 区间 2：seq 10..19 全收 → exp_i=10, rec_i=10, lost_i=0 → fraction=0
+    for (std::uint16_t i = 10; i < 20; ++i) {
+        OwnedPacket o(0x1234, i, i * 3000);
+        tr.on_rtp_received(o.get(), static_cast<std::int64_t>(i) * 33000);
+    }
+    st = tr.find(0x1234);
+    REQUIRE(st != nullptr);
+    CHECK_EQ(st->fraction_lost(), std::uint8_t{0});   // 曾为累计值 12
+    CHECK_EQ(st->cumulative_lost(), std::int64_t{1}); // 累计丢包仍是 1
+}
+
+// ---------------------------------------------------------------------------
+// N+2. 纯接收者（只发 RR）进成员表，但不算发送者、不生成报告块
+// ---------------------------------------------------------------------------
+NETMECH_TEST(tracker_rr_only_source_joins_members)
+{
+    SourceTracker tr(/*local_ssrc=*/1, 90000);
+    ReceiverReport rr;
+    rr.ssrc = 0x9999;   // 从没发过 RTP 的纯接收者
+    tr.on_receiver_report(rr, 1000);
+
+    CHECK_EQ(tr.size(), std::size_t{1});          // 进成员表（曾为 0）
+    CHECK_EQ(tr.sender_count(), std::size_t{0});  // 不是发送者
+    CHECK(tr.build_report_blocks().empty());      // 无接收统计可报告
+    CHECK(tr.find(0x9999) != nullptr);
+}
+
+// ---------------------------------------------------------------------------
+// N+3. SDES 同样纳入成员表（捕获还没发过 SR/RR 的成员）
+// ---------------------------------------------------------------------------
+NETMECH_TEST(tracker_sdes_source_joins_members)
+{
+    SourceTracker tr(/*local_ssrc=*/1, 90000);
+    SdesReport sdes;
+    SdesChunk chunk;
+    chunk.ssrc  = 0x8888;
+    chunk.cname = "peer@example";
+    sdes.chunks.push_back(chunk);
+    tr.on_sdes(sdes, 2000);
+
+    CHECK_EQ(tr.size(), std::size_t{1});
+    CHECK_EQ(tr.sender_count(), std::size_t{0});
+
+    // 本端 SSRC 的 chunk 不计入
+    SdesReport self;
+    SdesChunk sc;
+    sc.ssrc = 1;
+    self.chunks.push_back(sc);
+    tr.on_sdes(self, 3000);
+    CHECK_EQ(tr.size(), std::size_t{1});
+}
+
+// ---------------------------------------------------------------------------
+// N+4. build_report_blocks 按 limit 截断（MTU 预算，RFC 3550 §6.2）
+// ---------------------------------------------------------------------------
+NETMECH_TEST(tracker_report_blocks_respect_limit)
+{
+    SourceTracker tr(0, 90000);
+    for (std::uint32_t s = 1; s <= 10; ++s) {
+        OwnedPacket o(s, 0, 0);
+        tr.on_rtp_received(o.get(), static_cast<std::int64_t>(s) * 1000);
+    }
+    CHECK_EQ(tr.build_report_blocks().size(), std::size_t{10});
+    CHECK_EQ(tr.build_report_blocks(3).size(), std::size_t{3});
+    CHECK_EQ(tr.build_report_blocks(0).size(), std::size_t{0});
+    CHECK_EQ(tr.build_report_blocks(100).size(), std::size_t{10});  // 硬上限 31 内
+}

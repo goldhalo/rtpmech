@@ -125,7 +125,13 @@ public:
     /// @param[in] senders 其中正在发送 RTP 数据的数量。
     ///
     /// @note 参与者数量变化会立即影响下一次间隔计算（RFC 3550 要求）。
+    ///       成员数**下降**时按 RFC 3550 A.7 做 reverse reconsideration：
+    ///       新间隔比已排的下一拍更早就提前（只提前不推后）。
     void update_members(std::size_t members, std::size_t senders) noexcept;
+
+    /// 设置本端角色（是否为发送者）。RFC 3550 §6.2 的 25%/75% 带宽
+    /// 划分按本端角色取对应份额；会话层每拍按 sent_since_report 刷新。
+    void set_local_sender(bool is_sender) noexcept { local_is_sender_ = is_sender; }
 
     /// 当前参与者数量。
     [[nodiscard]] std::size_t members() const noexcept { return members_; }
@@ -187,6 +193,8 @@ private:
     double   session_bandwidth_ = 0.0;   ///< 字节/秒；0 = 未设置（用默认）
     std::size_t members_    = 1;
     std::size_t senders_    = 0;
+    bool     local_is_sender_ = false;   ///< 本端角色（25%/75% 份额划分用）
+    double   last_now_sec_    = 0.0;     ///< 最近一次 on_rtcp_sent/reset 的时刻（reconsideration 用）
     /// 平均 RTCP 包大小。声明为 mutable 的原因：
     /// RFC 3550 附录 A.7 的"规范化"要求：当计算出的间隔小于最小间隔时，
     /// 需**就地放大** avg_packet_size 以保持长期平均带宽 —— 这发生在

@@ -149,7 +149,13 @@ public:
     ///
     /// @note RTT 计算：若 RR 的 lsr 匹配我们最近发出的 SR，
     ///       RTT = (now - sr_sent_time) - dlsr（dlsr 单位 1/65536 秒）。
+    /// @note 纯接收者（只发 RR、不发 RTP）也会进成员表：否则广播场景
+    ///       成员数被严重低估，RTCP 合计带宽会击穿 5% 上限（RFC 3550 §6.2）。
     void on_receiver_report(const ReceiverReport& rr, std::int64_t now_us);
+
+    /// 收到 SDES 时调用：把各 chunk 的 SSRC 纳入成员表（不置 is_sender）。
+    /// 捕获还没发过 SR/RR 的成员，保证成员数完整。
+    void on_sdes(const SdesReport& sdes, std::int64_t now_us);
 
     /// 收到 BYE 时移除对应源。
     void on_bye(const ByeReport& bye);
@@ -194,8 +200,19 @@ public:
     /// 清空全部状态。
     void clear() noexcept;
 
-    /// 生成用于 RR/SR 的报告块列表（最多 31 个，按最近活跃排序）。
-    [[nodiscard]] std::vector<ReportBlock> build_report_blocks() const;
+    /// 生成用于 RR/SR 的报告块列表（按最近活跃排序）。
+    ///
+    /// @param[in] limit 最多生成几个（RTCP RC 只有 5 位，硬上限 31）。
+    ///                  调用方按 MTU 预算传入更小的值（RFC 3550 §6.2：
+    ///                  装不下时截断报告块数量，而不是整包放弃）。
+    [[nodiscard]] std::vector<ReportBlock> build_report_blocks(std::size_t limit = 31) const;
+
+    /// 报告成功发出后调用：对**被报告的源**采样 expected/received，
+    /// 作为下一区间 fraction lost 的基线（RFC 3550 A.3）。
+    ///
+    /// 不调用的话 expected_prior/received_prior 永远是 0，fraction lost
+    /// 退化成累计丢包率：早期一次丢包突发后即使链路恢复干净也居高不下。
+    void commit_report_sampling(const std::vector<ReportBlock>& reported);
 
 private:
     SourceStats& get_or_create(std::uint32_t ssrc, std::int64_t now_us);

@@ -246,7 +246,28 @@ void SourceTracker::on_sender_report(const SenderReport& sr,
 void SourceTracker::on_receiver_report(const ReceiverReport& rr,
                                        std::int64_t now_us)
 {
+    // ★ 纯接收者（只发 RR/SDES、从不发 RTP）也必须进成员表：
+    //   以前这里只处理报告块算 RTT，不为 rr.ssrc 建源条目 ——
+    //   1 发送者 + N 纯接收者的广播场景里，每个接收者的成员表
+    //   只有发送者，members=2，各自按小成员数算间隔 → N 路合计
+    //   RTCP ≈ N×2.5% 会话带宽，击穿 RFC 3550 §6.2 的 5% 上限。
+    if (local_ssrc_ == 0 || rr.ssrc != local_ssrc_) {
+        SourceStats& st = get_or_create(rr.ssrc, now_us);
+        st.last_activity_us = now_us;   // 不置 is_sender：没收到过它的 RTP
+    }
     handle_report_blocks(rr.reports, now_us);
+}
+
+void SourceTracker::on_sdes(const SdesReport& sdes, std::int64_t now_us)
+{
+    // SDES 同样纳入成员表：捕获还没发过 SR/RR 的成员。
+    for (const SdesChunk& chunk : sdes.chunks) {
+        if (local_ssrc_ != 0 && chunk.ssrc == local_ssrc_) {
+            continue;
+        }
+        SourceStats& st = get_or_create(chunk.ssrc, now_us);
+        st.last_activity_us = now_us;
+    }
 }
 
 void SourceTracker::handle_report_blocks(const std::vector<ReportBlock>& blocks,
@@ -346,9 +367,10 @@ void SourceTracker::clear() noexcept
     has_rtt_               = false;
 }
 
-std::vector<ReportBlock> SourceTracker::build_report_blocks() const
+std::vector<ReportBlock> SourceTracker::build_report_blocks(std::size_t limit) const
 {
-    // 按最近活跃排序，最多 31 个（RTCP RC 只有 5 位）
+    // 按最近活跃排序；硬上限 31（RTCP RC 只有 5 位），调用方可按 MTU 传更小值
+    const std::size_t cap = std::min<std::size_t>(limit, 31u);
     std::vector<const SourceStats*> sorted;
     sorted.reserve(sources_.size());
     for (const auto& kv : sources_) {
@@ -360,8 +382,8 @@ std::vector<ReportBlock> SourceTracker::build_report_blocks() const
               [](const SourceStats* a, const SourceStats* b) {
                   return a->last_activity_us > b->last_activity_us;
               });
-    if (sorted.size() > 31) {
-        sorted.resize(31);
+    if (sorted.size() > cap) {
+        sorted.resize(cap);
     }
 
     std::vector<ReportBlock> blocks;
@@ -405,6 +427,21 @@ std::vector<ReportBlock> SourceTracker::build_report_blocks() const
         blocks.push_back(rb);
     }
     return blocks;
+}
+
+void SourceTracker::commit_report_sampling(const std::vector<ReportBlock>& reported)
+{
+    // RFC 3550 A.3：报告发出后对被报告的源采样，作为下一区间的基线。
+    // 只采样**被报告的**源：超过 limit 被截断的源下一轮还要用旧基线。
+    for (const ReportBlock& rb : reported) {
+        auto it = sources_.find(rb.ssrc);
+        if (it == sources_.end()) {
+            continue;
+        }
+        SourceStats& st = it->second;
+        st.expected_prior = st.ext_max_seq - st.base_seq + 1;
+        st.received_prior = st.received;
+    }
 }
 
 } // namespace rtpmech

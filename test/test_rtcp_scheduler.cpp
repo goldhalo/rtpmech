@@ -237,3 +237,102 @@ NETMECH_TEST(sched_senders_capped_at_members)
     s.update_members(3, 100);
     CHECK_EQ(s.senders(), std::size_t{3});
 }
+
+// ---------------------------------------------------------------------------
+// 13. 发送者/接收者 25%/75% 带宽划分（RFC 3550 §6.2，M3）
+//     1 发送者 + 99 接收者：发送者应享 25% 带宽，而不是 1/100。
+// ---------------------------------------------------------------------------
+NETMECH_TEST(sched_sender_gets_quarter_share)
+{
+    RtcpSchedulerParams p;
+    p.min_interval_sec = 0.0;
+    p.use_half_at_startup = false;
+    p.initial_avg_packet_size = 100;
+
+    RtcpScheduler s(p);
+    s.set_session_bandwidth(100000.0);   // rtcp_bw = 5000 B/s
+    s.update_members(100, 1);
+
+    // 本端是发送者：T = avg×senders / (0.25×rtcp_bw) = 100×1/1250 = 0.08
+    s.set_local_sender(true);
+    const double t_sender = s.deterministic_interval();
+    CHECK(t_sender > 0.079 && t_sender < 0.081);
+
+    // 本端是接收者：T = avg×receivers / (0.75×rtcp_bw) = 100×99/3750 = 2.64
+    s.set_local_sender(false);
+    const double t_receiver = s.deterministic_interval();
+    CHECK(t_receiver > 2.63 && t_receiver < 2.65);
+
+    // 旧实现对两者都给 100×100/5000 = 2.0 —— 发送者慢了 25 倍
+    CHECK(t_sender < t_receiver / 20.0);
+}
+
+// ---------------------------------------------------------------------------
+// 14. 发送者占比 > 25%：全体共同分摊
+// ---------------------------------------------------------------------------
+NETMECH_TEST(sched_many_senders_share_all)
+{
+    RtcpSchedulerParams p;
+    p.min_interval_sec = 0.0;
+    p.use_half_at_startup = false;
+    p.initial_avg_packet_size = 100;
+
+    RtcpScheduler s(p);
+    s.set_session_bandwidth(100000.0);
+    s.update_members(10, 5);   // 50% > 25%
+
+    s.set_local_sender(true);
+    const double t1 = s.deterministic_interval();   // 100×10/5000 = 0.2
+    s.set_local_sender(false);
+    const double t2 = s.deterministic_interval();
+    CHECK(t1 > 0.19 && t1 < 0.21);
+    CHECK(t2 > 0.19 && t2 < 0.21);
+}
+
+// ---------------------------------------------------------------------------
+// 15. 无发送者：接收者使用全部 RTCP 带宽
+// ---------------------------------------------------------------------------
+NETMECH_TEST(sched_no_senders_full_bandwidth)
+{
+    RtcpSchedulerParams p;
+    p.min_interval_sec = 0.0;
+    p.use_half_at_startup = false;
+    p.initial_avg_packet_size = 100;
+
+    RtcpScheduler s(p);
+    s.set_session_bandwidth(100000.0);
+    s.update_members(10, 0);
+    s.set_local_sender(false);
+    const double t = s.deterministic_interval();    // 100×10/5000 = 0.2
+    CHECK(t > 0.19 && t < 0.21);
+}
+
+// ---------------------------------------------------------------------------
+// 16. reverse reconsideration（RFC 3550 A.7，M3）：成员数下降时
+//     下一拍只提前不推后。
+// ---------------------------------------------------------------------------
+NETMECH_TEST(sched_reverse_reconsideration_on_member_drop)
+{
+    RtcpSchedulerParams p;
+    p.min_interval_sec = 0.0;
+    p.use_half_at_startup = false;
+    p.initial_avg_packet_size = 100;
+
+    RtcpScheduler s(p);
+    s.set_session_bandwidth(100000.0);
+    s.update_members(100, 0);
+    s.on_rtcp_sent(100, 0.0);   // T=2 → 下一拍∈[1,3)
+    const double before = s.time_until_next(0.0);
+    CHECK(before >= 1.0 && before < 3.0);
+
+    // 大批 BYE：成员 100 → 2，T_new = 0.04 → 下一拍应提前到 ≈0.04
+    s.update_members(2, 0);
+    const double after = s.time_until_next(0.0);
+    CHECK(after < before);
+    CHECK(after < 0.5);
+
+    // 成员回升：不推后已提前的下一拍
+    s.update_members(100, 0);
+    const double again = s.time_until_next(0.0);
+    CHECK(again <= after + 1e-9);
+}

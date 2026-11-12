@@ -187,8 +187,9 @@ class PsPacketizer : public rtpmech::Packetizer {
 - **netmech**（底层网络库，**链接期依赖**，默认以静态库形式链入）
 
 > 头文件层面不依赖它（见下方"安装"）。静态构建时**链接**需要 `libnetmech.a`；
-> 构建成共享库（`-DRTPMECH_LIBRARY_TYPE=SHARED`）时 netmech 会被静态链入
-> `librtpmech.so`，对外发布**不需要**单独附 netmech 的二进制（MIT 许可证声明仍需保留）。
+> 构建成共享库（`-DRTPMECH_LIBRARY_TYPE=SHARED`）时 netmech 也以**共享库**提供
+> （避免同进程出现两份 Runtime 副本，netmech 明确禁止跨副本注入），
+> 对外发布**需要随附 `libnetmech.so` / `netmech.dll`**（MIT 许可证声明仍需保留）。
 
 netmech 默认从 `thirdparty/netmech` 取（git submodule）。开发时也可以直接指向本地目录：
 
@@ -363,8 +364,10 @@ cmake --build build-shared
 
 - 公共 API 用 `RTPMECH_API` 导出（Windows `dllexport/dllimport`，Linux 配合
   `CXX_VISIBILITY_PRESET=hidden`）；
-- 静态链入的 netmech 符号会被隐藏（`-Wl,--exclude-libs,ALL`），不会污染你的 ABI；
-- 对外发布时**不需要**附带 netmech 的二进制，但需保留 netmech 的 MIT 许可证声明。
+- netmech 以共享库提供（避免同进程两份 Runtime 副本），`librtpmech.so`
+  运行时依赖 `libnetmech.so`；
+- 对外发布**需要随附 netmech 的二进制**（`libnetmech.so` / `netmech.dll`），
+  并保留 netmech 的 MIT 许可证声明。
 
 ### 注入 io 运行时（线程数由应用决定）
 

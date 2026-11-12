@@ -54,8 +54,9 @@ option(RTPMECH_WARNINGS_AS_ERRORS "把编译告警当错误（CI 用）" OFF)
 option(RTPMECH_BUILD_BENCH    "构建压测工具" OFF)
 
 # 库类型：STATIC（默认）/ SHARED。
-# SHARED 时公共 API 加 RTPMECH_API 导出宏、隐藏静态链入的 netmech 符号，
-# 并给使用方定义 RTPMECH_SHARED（Windows 下切 dllimport）。
+# SHARED 时公共 API 加 RTPMECH_API 导出宏、netmech 也以 SHARED 提供
+# （避免同进程两份 Runtime 副本），并给使用方定义 RTPMECH_SHARED
+# （Windows 下切 dllimport）。发布 SHARED 产物需随附 libnetmech 二进制。
 set(RTPMECH_LIBRARY_TYPE "STATIC" CACHE STRING "库类型：STATIC 或 SHARED")
 
 # ★ SHARED 构建必须让 netmech 也以共享库提供：只静态链 netmech 的话，
@@ -113,30 +114,37 @@ message(STATUS "rtpmech: netmech @ ${RTPMECH_NETMECH_DIR}")
 # ---------------------------------------------------------------------------
 # 3. 编译选项
 # ---------------------------------------------------------------------------
+# 分两层：
+#   * rtpmech_compile_options：**用法要求**，随导出 target 传给使用方
+#     （/utf-8 是正确解析本库 UTF-8 头文件所必需；MSVC 宏是 Windows 头
+#     的常规用法要求）。不含告警等级 —— 本库开 WARNINGS_AS_ERRORS 构建
+#     时不能把使用方自己的告警也变成错误（s1）。
+#   * rtpmech_apply_warnings()：**构建期告警**，只作用于本仓各 target
+#     （PRIVATE），不进导出接口。
 add_library(rtpmech_compile_options INTERFACE)
 
 if(MSVC)
-    target_compile_options(rtpmech_compile_options INTERFACE
-        /W4
-        /utf-8
-        /bigobj
-        $<$<BOOL:${RTPMECH_WARNINGS_AS_ERRORS}>:/WX>
-    )
+    target_compile_options(rtpmech_compile_options INTERFACE /utf-8)
     target_compile_definitions(rtpmech_compile_options INTERFACE
         _WIN32_WINNT=0x0601
         WIN32_LEAN_AND_MEAN
         NOMINMAX
-        _CRT_SECURE_NO_WARNINGS
     )
-    # Asio 内部的符号遮蔽（第三方代码），定向抑制
-    target_compile_options(rtpmech_compile_options INTERFACE /wd4459)
     set(CMAKE_MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>DLL")
-else()
-    target_compile_options(rtpmech_compile_options INTERFACE
-        -Wall -Wextra -Wpedantic
-        $<$<BOOL:${RTPMECH_WARNINGS_AS_ERRORS}>:-Werror>
-    )
 endif()
+
+function(rtpmech_apply_warnings tgt)
+    if(MSVC)
+        target_compile_options(${tgt} PRIVATE
+            /W4 /bigobj /wd4459
+            $<$<BOOL:${RTPMECH_WARNINGS_AS_ERRORS}>:/WX>)
+        target_compile_definitions(${tgt} PRIVATE _CRT_SECURE_NO_WARNINGS)
+    else()
+        target_compile_options(${tgt} PRIVATE
+            -Wall -Wextra -Wpedantic
+            $<$<BOOL:${RTPMECH_WARNINGS_AS_ERRORS}>:-Werror>)
+    endif()
+endfunction()
 
 # ---------------------------------------------------------------------------
 # 4. 库
@@ -173,6 +181,7 @@ target_include_directories(rtpmech PUBLIC
 target_link_libraries(rtpmech
     PUBLIC  netmech
     PRIVATE rtpmech_compile_options)
+rtpmech_apply_warnings(rtpmech)
 
 target_compile_features(rtpmech PUBLIC cxx_std_17)
 
@@ -190,7 +199,8 @@ if(RTPMECH_LIBRARY_TYPE STREQUAL "SHARED")
     if(MSVC)
         target_compile_options(rtpmech PRIVATE /wd4251)
     elseif(UNIX AND NOT APPLE)
-        # netmech 是静态链入本库的，默认可见性会把它的内部符号全部导出。
+        # netmech 本身以 SHARED 提供（见上方强制策略）；此标志作用于
+        # 其余静态链入的归档，防止内部符号泄漏。
         target_link_options(rtpmech PRIVATE "-Wl,--exclude-libs,ALL")
     elseif(APPLE)
         target_link_options(rtpmech PRIVATE "-Wl,-hidden-lsymbols")
@@ -213,6 +223,7 @@ if(RTPMECH_BUILD_TESTS)
             "${CMAKE_CURRENT_SOURCE_DIR}/src"      # 内部头（tracker / scheduler）
             "${RTPMECH_NETMECH_DIR}/test")
         target_link_libraries(rtpmech_ut PRIVATE rtpmech rtpmech_compile_options)
+        rtpmech_apply_warnings(rtpmech_ut)
 
         enable_testing()
         add_test(NAME rtpmech_ut COMMAND rtpmech_ut)
@@ -230,6 +241,7 @@ if(RTPMECH_BUILD_EXAMPLES)
         add_executable(${name} ${src})
         set_target_properties(${name} PROPERTIES FOLDER "rtpmech/example")
         target_link_libraries(${name} PRIVATE rtpmech rtpmech_compile_options)
+        rtpmech_apply_warnings(${name})
     endforeach()
 endif()
 
@@ -244,6 +256,7 @@ if(RTPMECH_BUILD_BENCH)
         add_executable(${name} ${src})
         set_target_properties(${name} PROPERTIES FOLDER "rtpmech/bench")
         target_link_libraries(${name} PRIVATE rtpmech rtpmech_compile_options)
+        rtpmech_apply_warnings(${name})
     endforeach()
 endif()
 
@@ -263,7 +276,7 @@ install(TARGETS rtpmech
         LIBRARY DESTINATION ${CMAKE_INSTALL_LIBDIR}
         RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR})
 
-# 编译选项载体（PRIVATE 依赖在静态库场景下仍会进 interface，必须一起导出）
+# 编译选项载体（用法要求；PRIVATE 依赖在静态库场景下仍会进 interface，必须一起导出）
 install(TARGETS rtpmech_compile_options EXPORT rtpmechTargets)
 
 install(DIRECTORY include/rtpmech

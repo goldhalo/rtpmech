@@ -1004,3 +1004,190 @@ NETMECH_TEST(session_accepts_injected_runtime)
     rt->shutdown();
     CHECK(!rt->running());
 }
+
+// ---------------------------------------------------------------------------
+// 22. create 失败不得触发 on_close（m3："成功创建的会话恰好一次"）
+// ---------------------------------------------------------------------------
+NETMECH_TEST(session_create_failure_does_not_call_on_close)
+{
+    std::error_code ec;
+    // 用裸 UDP 端点占住一个奇数端口 O：会话 RTP=O-1 空闲、RTCP=O 被占
+    // → RTCP 绑定失败 → 整对失败（create 返回 nullptr）。
+    std::shared_ptr<netmech::UdpEndpoint> blocker;
+    std::uint16_t odd_port = 0;
+    for (int i = 0; i < 32; ++i) {
+        netmech::UdpConfig uc;
+        uc.bind = netmech::Address("127.0.0.1", 0);
+        blocker = netmech::create_udp_endpoint(
+            uc, std::make_shared<DiscardUdpHandler>(), nullptr, ec);
+        REQUIRE(blocker != nullptr);
+        odd_port = blocker->local_address().port();
+        if ((odd_port & 1u) != 0) { break; }
+        blocker->close();
+        blocker.reset();
+    }
+    REQUIRE((odd_port & 1u) != 0);
+
+    auto cfg = base_cfg();
+    cfg.local = Endpoint("127.0.0.1", static_cast<std::uint16_t>(odd_port - 1));
+    auto handler = std::make_shared<Collector>();
+    auto failed = RtpSession::create(cfg, handler, ec);
+    CHECK(failed == nullptr);
+    CHECK(ec);   // 绑定失败的具体码由 netmech 给（如 address_in_use）
+
+    // do_close 是异步投递的，等一下再确认 on_close 从未被调
+    std::this_thread::sleep_for(100ms);
+    CHECK_EQ(handler->closed.load(), 0);   // 曾为 1（从未存在的会话的关闭通知）
+    blocker->close();
+}
+
+// ---------------------------------------------------------------------------
+// 23. 显式端口 65535 被拒绝（m4：round_up_even 溢出成 0 会变随机分配）
+// ---------------------------------------------------------------------------
+NETMECH_TEST(session_rejects_port_65535)
+{
+    std::error_code ec;
+    auto cfg = base_cfg();
+    cfg.local = Endpoint("127.0.0.1", 65535);
+    auto sess = RtpSession::create(cfg, std::make_shared<NullHandler>(), ec);
+    CHECK(sess == nullptr);
+    CHECK(ec == RtpErrc::invalid_argument);
+}
+
+// ---------------------------------------------------------------------------
+// 24. 超长 BYE reason 截断到 255 而不是静默不发（m2）
+//     观察发送端 rtcp_sent：修复前 reason>255 使 build 返回 0，
+//     send_bye 一个字节都不发。（接收端按 §6.1 拒收单独 BYE 复合包，
+//     这是既有策略，故不做端到端观察。）
+// ---------------------------------------------------------------------------
+NETMECH_TEST(session_bye_long_reason_is_truncated)
+{
+    std::error_code ec;
+    auto cfg = base_cfg();
+    cfg.remote = Endpoint("127.0.0.1", 9);   // 无需有人听
+    auto tx = RtpSession::create(cfg, std::make_shared<NullHandler>(), ec);
+    REQUIRE(!ec);
+
+    tx->send_bye(std::string(300, 'x'), /*close_after=*/false);
+    REQUIRE(wait_for([&] { return tx->stats().rtcp_sent >= 1u; }));
+    tx->close();
+}
+
+// ---------------------------------------------------------------------------
+// 25. 小 MTU + 多源：RTCP 截断报告块而不是永久停发（m1）
+// ---------------------------------------------------------------------------
+NETMECH_TEST(session_rtcp_small_mtu_truncates_blocks)
+{
+    std::error_code ec;
+    auto cfg = base_cfg();
+    cfg.max_packet_size = 96;   // 装不下 4 个报告块 + SDES，但装得下截断后的
+    cfg.remote = Endpoint("127.0.0.1", 9);   // RTCP 目标无需有人听
+    auto sess = RtpSession::create(cfg, std::make_shared<NullHandler>(), ec);
+    REQUIRE(!ec);
+
+    // 注入 4 个不同 SSRC 的 SR，让 tracker 有 4 个源。
+    // 单个端点 + 重发循环：WSL 的 UDP 环回在突发下会丢包，
+    // 多发几轮保证送达（重复包不影响源表，SSRC 去重）。
+    std::vector<std::vector<std::uint8_t>> srs(4);
+    for (std::uint32_t i = 0; i < 4; ++i) {
+        std::vector<std::uint8_t> buf(256);
+        SenderReport sr;
+        sr.ssrc = 0x1000 + i;
+        std::error_code bec;
+        const auto n = build_rtcp_sender_report(buf.data(), buf.size(), sr, bec);
+        REQUIRE(!bec);
+        buf.resize(n);
+        srs[i] = std::move(buf);
+    }
+    netmech::UdpConfig uc;
+    uc.bind = netmech::Address("127.0.0.1", 0);
+    auto ep = netmech::create_udp_endpoint(
+        uc, std::make_shared<DiscardUdpHandler>(), nullptr, ec);
+    REQUIRE(ep != nullptr);
+    const netmech::Address dst("127.0.0.1", sess->local_rtcp_port());
+    for (int round = 0; round < 20; ++round) {
+        if (sess->stats().rtcp_received >= 4u) { break; }
+        for (const auto& b : srs) {
+            (void)ep->send_to(dst, netmech::ConstBuf{nullptr, b.data(), b.size()});
+        }
+        std::this_thread::sleep_for(20ms);
+    }
+    REQUIRE(wait_for([&] { return sess->stats().rtcp_received >= 4u; }));
+    CHECK_EQ(sess->stats().active_sources, std::size_t{4});
+
+    REQUIRE(sess->send_rtcp_now());
+    REQUIRE(wait_for([&] { return sess->stats().rtcp_sent >= 1u; }));
+    CHECK_EQ(sess->stats().rtcp_send_failures, std::uint64_t{0});   // 曾每拍都失败
+    ep->close();
+    sess->close();
+}
+
+// ---------------------------------------------------------------------------
+// 26. 纯接收者（RR/SDES）进成员表（M2 的会话层接线）
+// ---------------------------------------------------------------------------
+NETMECH_TEST(session_rr_and_sdes_sources_counted)
+{
+    std::error_code ec;
+    auto sess = RtpSession::create(base_cfg(), std::make_shared<NullHandler>(), ec);
+    REQUIRE(!ec);
+
+    // 复合包：RR（ssrc=0xAAAA，无报告块）+ SDES（ssrc=0xBBBB）
+    std::vector<std::uint8_t> buf(512);
+    std::error_code bec;
+    ReceiverReport rr;
+    rr.ssrc = 0xAAAA;
+    auto n = build_rtcp_receiver_report(buf.data(), buf.size(), rr, bec);
+    REQUIRE(!bec);
+    SdesReport sdes;
+    SdesChunk chunk;
+    chunk.ssrc  = 0xBBBB;
+    chunk.cname = "pure-receiver";
+    sdes.chunks.push_back(chunk);
+    const auto n2 = build_rtcp_sdes(buf.data() + n, buf.size() - n, sdes, bec);
+    REQUIRE(!bec);
+    buf.resize(n + n2);
+
+    auto ep = send_raw_udp(sess->local_rtcp_port(), buf);
+    REQUIRE(wait_for([&] { return sess->stats().rtcp_received >= 1u; }));
+    // 两个纯接收者都应进成员表（曾为 0，广播场景 RTCP 带宽会击穿 5%）
+    CHECK_EQ(sess->stats().active_sources, std::size_t{2});
+    if (ep) { ep->close(); }
+    sess->close();
+}
+
+// ---------------------------------------------------------------------------
+// 27. 入向流量还在跑时释放最后一个 shared_ptr（M4 压力回归）
+//     修复前 io 线程可能解引用已释放的 facade_（ASan 可抓）。
+// ---------------------------------------------------------------------------
+NETMECH_TEST(session_destroy_under_inbound_traffic)
+{
+    const std::uint8_t payload[16] = {0, 1, 2, 3, 4, 5, 6, 7,
+                                      8, 9, 10, 11, 12, 13, 14, 15};
+    for (int round = 0; round < 20; ++round) {
+        std::error_code ec;
+        auto collector = std::make_shared<Collector>();
+        auto rx_cfg = base_cfg();
+        rx_cfg.enable_rtcp = false;
+        auto rx = RtpSession::create(rx_cfg, collector, ec);
+        REQUIRE(!ec);
+
+        auto tx_cfg = base_cfg();
+        tx_cfg.enable_rtcp = false;
+        tx_cfg.remote = Endpoint("127.0.0.1", rx->local_rtp_port());
+        auto tx = RtpSession::create(tx_cfg, std::make_shared<NullHandler>(), ec);
+        REQUIRE(!ec);
+
+        std::thread feeder([&] {
+            for (int i = 0; i < 200; ++i) {
+                if (tx->send(ConstBuf{nullptr, payload, sizeof payload}, false) !=
+                    SendResult::accepted) {
+                    break;
+                }
+            }
+        });
+        std::this_thread::sleep_for(2ms);   // 让部分包已在 io 线程上处理
+        rx.reset();                          // ★ 流量在途时释放门面
+        feeder.join();
+        tx->close();
+    }
+}

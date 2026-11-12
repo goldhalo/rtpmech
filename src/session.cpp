@@ -24,6 +24,7 @@
 #include <rtpmech/rtp_packet.hpp>
 
 #include <netmech/net.hpp>
+#include <netmech/runtime.hpp>
 #include <rtpmech/packetizer.hpp>
 
 #include "rtcp_scheduler.hpp"
@@ -31,6 +32,7 @@
 
 #include <algorithm>
 #include <chrono>
+#include <condition_variable>
 #include <cstdio>
 #include <vector>
 #include <optional>
@@ -159,14 +161,17 @@ public:
             }
         }
 
-        void on_close(netmech::UdpEndpoint&, std::error_code) override
+        void on_close(netmech::UdpEndpoint& ep, std::error_code ec) override
         {
             if (auto self = owner_.lock()) {
-                // ★ 只有会话**已经 open** 时，端点关闭才代表"连接没了"。
-                //   端口搜索阶段会主动丢弃奇数端口的端点，那时的 on_close
-                //   属于内部动作，不能把会话判死。
-                if (self->is_open()) {
-                    Impl::request_close(self);
+                // ★ 只有会话**已经 open** 且关闭的是**当前 RTP 端点**时，
+                //   才代表"连接没了"。端口搜索阶段会主动丢弃奇数端口的
+                //   端点，它们与最终端点共用同一个 Impl；netmech 外部线程
+                //   close() 最多等 500ms，io 线程阻塞时 on_close 会迟到 ——
+                //   不校验身份的话，迟到的回调会误杀刚建好的健康会话。
+                //   on_close 在 io 线程上执行，读 rtp_ep_ 安全。
+                if (self->is_open() && &ep == self->rtp_ep_.get()) {
+                    Impl::request_close(self, ec);
                 }
             }
         }
@@ -200,8 +205,6 @@ public:
 
     std::error_code open(std::shared_ptr<RtpHandler> h)
     {
-        handler_ = std::move(h);
-
         // ---- RTP 端点 ----
         std::error_code ec;
         if (!open_rtp_endpoint(ec)) {
@@ -239,6 +242,11 @@ public:
         scheduler_.reset(steady_now_sec());
 
         first_send_time_ = steady_clock_t::now();
+        // ★ handler 在 open 成功末尾才接管：以前第一行就存，RTCP 绑定
+        //   失败后 create 返回 nullptr → 析构 → do_close → on_close，
+        //   应用会收到一个从未存在过的会话的关闭通知（违反"成功创建
+        //   的会话恰好一次"契约）。放在 open_ 置位前，保证回调可见。
+        handler_ = std::move(h);
         open_.store(true, std::memory_order_release);
 
         // 没有 remote 时排定时器只会「每秒上千次尝试发送并失败」（见 rtcp_failed）。
@@ -339,6 +347,10 @@ public:
                 tracker_.on_sender_report(*sr, now_us);
             } else if (const ReceiverReport* rr = pkt.as_receiver_report()) {
                 tracker_.on_receiver_report(*rr, now_us);
+            } else if (const SdesReport* sdes = pkt.as_sdes()) {
+                // SDES 也喂 tracker：纯接收者（只发 RR/SDES）进成员表，
+                // 否则广播场景成员数低估 → RTCP 合计带宽击穿 5% 上限。
+                tracker_.on_sdes(*sdes, now_us);
             } else if (const ByeReport* bye = pkt.as_bye()) {
                 tracker_.on_bye(*bye);
             }
@@ -494,6 +506,9 @@ public:
             return SendResult::invalid;
         }
         if (!rtp_ep_->send_to(dst, netmech::ConstBuf{wire, wire->data(), written})) {
+            // 反压/运行时已停：计入 send_rejected（文档承诺的统计口径），
+            // 以前这里不计数，包级发送的反压在统计上不可见。
+            send_rejected_.fetch_add(1, std::memory_order_relaxed);
             return SendResult::closed;
         }
 
@@ -638,11 +653,22 @@ public:
         // is_sender 必须按"自上次报告以来"判断，并且要在喂调度器之前算：
         // 本端不是发送者时，senders 里不该把自己算进去。
         const bool is_sender = sent_since_report_;
+        scheduler_.set_local_sender(is_sender);
         scheduler_.update_members(tracker_.size() + 1,
                                   tracker_.sender_count() + (is_sender ? 1u : 0u));
         sync_tracker_stats();
 
-        const auto blocks = tracker_.build_report_blocks();
+        // ★ 按 MTU 预算截断报告块数量（RFC 3550 §6.2）：以前把最多 31 个
+        //   块全量塞进去，装不下时整包 build 失败 —— 每一拍都同样失败，
+        //   RTCP 永久静默停发。现在先算 SDES 占用，再用剩余预算限块数。
+        //   SDES：4 字节头 + round4(SSRC 4 + item(2+len) + END 1)。
+        const std::size_t sdes_body = 4 + 2 + cname_.size() + 1;
+        const std::size_t sdes_size = 4 + ((sdes_body + 3) & ~std::size_t(3));
+        const std::size_t head_size = is_sender ? 28u : 8u;   // SR 头 28 / RR 头 8
+        const std::size_t budget =
+            cfg_.max_packet_size > sdes_size + head_size
+                ? cfg_.max_packet_size - sdes_size - head_size : 0;
+        const auto blocks = tracker_.build_report_blocks(budget / 24);
 
         std::vector<std::uint8_t> buf(cfg_.max_packet_size, 0);
         std::size_t off = 0;
@@ -723,6 +749,10 @@ public:
 
         // 告诉调度器"发出去了、多大"，它据此更新平均包大小并排下一拍
         scheduler_.on_rtcp_sent(off, steady_now_sec());
+        // ★ 报告成功发出后才采样区间基线（RFC 3550 A.3）：以前
+        //   expected_prior/received_prior 从未被写入，fraction lost 退化成
+        //   累计丢包率。发送失败不采样，区间继续累积。
+        tracker_.commit_report_sampling(blocks);
         if (is_sender) {
             sent_since_report_ = false;   // 本报告已覆盖之前的发送
         }
@@ -777,7 +807,10 @@ public:
         ByeReport bye;
         bye.ssrcs.push_back(ssrc_.load(std::memory_order_acquire));
         if (!reason.empty()) {
-            bye.reason = reason;
+            // BYE reason 长度是单字节（≤255）：超长截断而不是静默不发。
+            // 以前 build_rtcp_bye 对 >255 返回 0，send_bye 遇 0 直接 return，
+            // 公开 API 接受任意长字符串却一个字节都不发。
+            bye.reason = reason.substr(0, 255);
         }
 
         const std::size_t n = build_rtcp_bye(buf.data(), buf.size(), bye, ec);
@@ -797,7 +830,10 @@ public:
     /// 收尾工作一律用 `asio::post` 投递到 io 线程 ——
     /// **不能用 dispatch**：从 io 线程内部调用时 dispatch 会就地执行、插到
     /// 已排队的 send 前面，把还没发出去的包连带端点一起丢掉。
-    static void request_close(std::shared_ptr<Impl> self) noexcept
+    ///
+    /// @param ec 关闭原因：空 = 主动 close；非空 = 端点异常（透传给 on_close）。
+    static void request_close(std::shared_ptr<Impl> self,
+                              std::error_code ec = {}) noexcept
     {
         if (!self) {
             return;
@@ -807,7 +843,7 @@ public:
         }
         self->open_.store(false, std::memory_order_release);
 
-        auto fn = [self] { self->do_close(); };
+        auto fn = [self, ec] { self->do_close(ec); };
         if (self->post_) {
             // ★ 一律排队（不内联）：close 必须排在已投递的发送之后，
             //   否则从 io 线程内部调用时会把还没发出去的包连端点一起丢掉。
@@ -818,7 +854,7 @@ public:
     }
 
     /// 收尾（**只在 io 线程上执行**）。
-    void do_close() noexcept
+    void do_close(std::error_code ec = {}) noexcept
     {
         send_bye({});            // 尽力发，不关心结果
 
@@ -833,8 +869,53 @@ public:
         }
 
         if (handler_) {
-            handler_->on_close(std::error_code{});
+            handler_->on_close(ec);
         }
+
+        // 通知等待收尾的析构线程（见 wait_closed）。
+        {
+            std::lock_guard<std::mutex> lk(close_mtx_);
+            close_done_ = true;
+        }
+        close_cv_.notify_all();
+    }
+
+    /// 析构时等待 io 线程收尾完成，消除 facade_ 悬垂（M4）。
+    ///
+    /// 以前 ~RtpSession 只翻标志 + 投递 do_close 就返回，门面对象随即
+    /// 释放；而 io 线程经 owner_.lock() 独立持有 Impl，可在释放后执行
+    /// handler_->on_packet(*facade_, ...) —— use-after-free。
+    /// do_close 与一切回调同线程串行，等到它完成即保证没有回调再碰 facade_。
+    void wait_closed() noexcept
+    {
+        {
+            std::lock_guard<std::mutex> lk(close_mtx_);
+            if (close_done_) {
+                return;
+            }
+        }
+        if (!post_) {
+            return;   // 端点未建立（create 失败）：没有 io 并发
+        }
+        // ★ 注入的 Runtime 已停止时 io 线程不再处理任务：do_close 可能
+        //   永远排不上（shutdown 抢在队列前），但此时也没有回调并发，
+        //   facade_ 安全，别白等超时。进程级默认运行时永不中止，不走这里。
+        if (cfg_.runtime && !cfg_.runtime->running()) {
+            return;
+        }
+        // 探测是否在本端点的 io 线程上：是则**不能等**（会死锁）。
+        // 同线程串行保证析构与回调不并发，且 do_close 不读 facade_，安全。
+        // ★ 标志用 shared_ptr：用户线程上探测任务会排队到 do_close 之后
+        //   才执行，那时 wait_closed 早已返回——抓栈引用会写已释放的栈帧。
+        auto on_io = std::make_shared<bool>(false);
+        post_([on_io] { *on_io = true; }, /*allow_inline=*/true);
+        if (*on_io) {
+            return;
+        }
+        // 用户线程：等 do_close 完成。超时兜底：io 线程卡死时不让析构永久悬挂。
+        std::unique_lock<std::mutex> lk(close_mtx_);
+        close_cv_.wait_for(lk, std::chrono::seconds(5),
+                           [this] { return close_done_; });
     }
 
     // -------------------------------------------------------------------------
@@ -937,7 +1018,13 @@ private:
         }
 
         if (want != 0) {
-            // 显式端口：向上取偶，绑不上就是失败（协商场景不重试）
+            // 显式端口：向上取偶，绑不上就是失败（协商场景不重试）。
+            // 65535 是奇数且 +1 溢出：round_up_even 会截断成 0，被当成
+            // "系统分配"静默绑到随机端口 —— 在这里明确拒绝。
+            if (want == 65535) {
+                ec = make_error_code(RtpErrc::invalid_argument);
+                return false;
+            }
             if (!try_bind_rtp(round_up_even(want), ec)) {
                 return false;
             }
@@ -1045,6 +1132,12 @@ private:
         const std::uint32_t new_ssrc = gen_random32();
         ssrc_.store(new_ssrc, std::memory_order_release);
         ssrc_collisions_.fetch_add(1, std::memory_order_relaxed);
+        // ★ RFC 3550 §8.2：换号后发送计数重置。以前不清零，下一份 SR
+        //   以新 SSRC 报告旧 SSRC 的累计包数/字节数，对端按新号基线
+        //   做统计会错乱。
+        rtp_sent_.store(0, std::memory_order_relaxed);
+        octet_sent_.store(0, std::memory_order_relaxed);
+        sent_since_report_ = false;
         // ★ tracker 里的 local_ssrc 也要跟着换：它用这个值把"自己发的包"和
         //   "报告我的 RR 块"挑出来。不同步的话，换号之后 RTT 匹配就断了，
         //   而且对端报告块里针对旧号的条目会被当成别的源。
@@ -1088,6 +1181,24 @@ private:
         }
     }
 
+    /// 墙钟模式的时间戳增量（采集即发场景）。
+    /// 先转 uint64 再截断 uint32：显式模 2^32 回绕。以前直接
+    /// float→uint32，乘积 ≥2^32（90kHz 约 13.25 小时）时值不可表示，
+    /// 属未定义行为 —— 7×24 监控场景必然命中。
+    std::uint32_t wall_ticks() const noexcept
+    {
+        const double elapsed = std::chrono::duration<double>(
+            steady_clock_t::now() - first_send_time_).count();
+        const double ticks = elapsed * static_cast<double>(cfg_.clock_rate);
+        if (ticks <= 0.0) {
+            return 0;
+        }
+        if (ticks >= 18446744073709551616.0) {   // 2^64，极端兜底
+            return 0xFFFFFFFFu;
+        }
+        return static_cast<std::uint32_t>(static_cast<std::uint64_t>(ticks));
+    }
+
     std::uint32_t next_timestamp()
     {
         if (ts_increment_ != 0) {
@@ -1096,10 +1207,7 @@ private:
             return ts;
         }
         // 按真实发送时刻（仅适用于"采集即发、无独立时间基"）
-        const double elapsed = std::chrono::duration<double>(
-            steady_clock_t::now() - first_send_time_).count();
-        return ts_base_ +
-               static_cast<std::uint32_t>(elapsed * static_cast<double>(cfg_.clock_rate));
+        return ts_base_ + wall_ticks();
     }
 
     std::uint32_t current_timestamp() const
@@ -1107,10 +1215,7 @@ private:
         if (ts_increment_ != 0) {
             return ts_current_;
         }
-        const double elapsed = std::chrono::duration<double>(
-            steady_clock_t::now() - first_send_time_).count();
-        return ts_base_ +
-               static_cast<std::uint32_t>(elapsed * static_cast<double>(cfg_.clock_rate));
+        return ts_base_ + wall_ticks();
     }
 
     RtpSessionConfig cfg_;
@@ -1179,6 +1284,11 @@ private:
     std::string cname_;
 
     std::string last_collision_from_;
+
+    // ---- 析构等待收尾（见 wait_closed / do_close）----
+    std::mutex              close_mtx_;
+    std::condition_variable close_cv_;
+    bool                    close_done_ = false;
 };
 
 // =============================================================================
@@ -1191,6 +1301,9 @@ RtpSession::~RtpSession()
 {
     if (impl_) {
         Impl::request_close(impl_);
+        // ★ 等 io 线程收尾完成再释放门面：否则入向流量还在跑时，
+        //   io 线程可能解引用已释放的 facade_（M4）。
+        impl_->wait_closed();
     }
 }
 
@@ -1214,6 +1327,17 @@ std::shared_ptr<RtpSession> RtpSession::create(const RtpSessionConfig&     cfg,
     if (cfg.cname.size() > 255) {
         ec = make_error_code(RtpErrc::invalid_argument);
         return nullptr;
+    }
+    // SDES(CNAME) + RR 头必须装进 max_packet_size，否则每拍 build 失败、
+    // RTCP 静默停发（m1 的创建期兜底；报告块可截断，CNAME 不能截）。
+    // 未显式给 cname 时用默认格式 "rtpmech-%08x"（16 字节）。
+    {
+        const std::size_t cname_len = cfg.cname.empty() ? 16u : cfg.cname.size();
+        const std::size_t sdes_min = 4 + ((4 + 2 + cname_len + 1 + 3) & ~std::size_t(3));
+        if (sdes_min + 8 > cfg.max_packet_size) {
+            ec = make_error_code(RtpErrc::invalid_argument);
+            return nullptr;
+        }
     }
 
     auto session = std::shared_ptr<RtpSession>(new RtpSession());

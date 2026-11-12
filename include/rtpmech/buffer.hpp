@@ -22,10 +22,13 @@ namespace rtpmech {
 ///
 /// @par 两种用法
 /// @code
-/// // 1) 同步安全：数据活到 send() 返回即可（库会在本次调用内拷进发送队列）
+/// // 1) 调用方保证生命周期：数据必须活到**发送真正执行**（io 线程），
+/// //    不是 send() 返回 —— send() 只是把视图投递到 io 线程，调用内
+/// //    不拷贝。栈缓冲仅当你能阻塞等待发送完成时才可用；否则一律用
+/// //    下面的 owner 形式（与 session.hpp 的 send 文档一致）。
 /// sess.send(rtpmech::ConstBuf{nullptr, data, len}, true);
 ///
-/// // 2) 异步安全：把数据的持有者一起传进来
+/// // 2) 异步安全（推荐）：把数据的持有者一起传进来，库代持到发出
 /// auto pkt = std::make_shared<std::vector<std::uint8_t>>(...);
 /// sess.send(rtpmech::ConstBuf{pkt, pkt->data(), pkt->size()}, true);
 /// @endcode
